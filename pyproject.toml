@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cs336-training"
+version = "0.1.0"
+description = "Transformer training core extracted from CS336 Assignment 1"
+requires-python = ">=3.12"
+dependencies = ["torch>=2.11", "numpy>=2", "einops>=0.8", "regex"]
+
+[project.optional-dependencies]
+test = ["pytest>=9", "pytest-timeout", "jaxtyping", "psutil", "tiktoken"]
+
+[tool.setuptools]
+packages = ["train"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
