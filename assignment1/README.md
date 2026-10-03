@@ -1,7 +1,8 @@
 # Assignment 1 training core
 
-This directory is the core training snapshot maintained as the `assignment1`
-subtree of the CS336 repository. The original learning files remain in Learn.
+The core training code is managed independently in the sibling CS336 repository,
+under `CS336/assignment1/`. This copy inside Learn is ignored by Learn Git.
+The original learning files remain in `assignment1-basics`.
 
 ```text
 assignment1/
@@ -30,35 +31,23 @@ json import inside main, uint16 batch conversion, tokenizer artifact loading
 and generation context management. This extraction is not a claim that full
 training has passed.
 
-## Subtree synchronization
+## Independent Git management
 
-Learn prefix: `learning_code/CS336/assignment1`
-
-CS336 prefix: `assignment1`
-
-From Learn, split the current core directory:
+Develop, commit and push from the sibling CS336 repository:
 
 ```sh
-git subtree split --prefix=learning_code/CS336/assignment1 -b assignment1-core
+cd ../CS336
+git add -- assignment1
+git commit -m "Update Assignment 1 training code"
+git push
 ```
 
-From CS336, merge updates from the local Learn repository:
+These commands assume the starting directory is the Learn repository root.
+Configure a CS336 remote before pushing. Learn no longer tracks its local
+`learning_code/CS336/assignment1` copy, and pushing Learn does not publish new
+changes from that copy. The copies do not synchronize automatically.
 
-```sh
-git subtree pull --prefix=assignment1 ../Learn assignment1-core --squash
-```
-
-For updates made in CS336, split its prefix into a branch:
-
-```sh
-git subtree split --prefix=assignment1 -b assignment1-core
-```
-
-Then from Learn:
-
-```sh
-git subtree pull --prefix=learning_code/CS336/assignment1 ../CS336 assignment1-core --squash
-```
-
-Split branches must be refreshed before pulling. Neither split command pushes
-to GitHub. Develop in one copy at a time and synchronize explicitly.
+The original subtree import and Learn `assignment1-core` branch remain as
+historical references. Do not use the former Learn subtree synchronization
+commands for ongoing development. Existing Learn history still contains the
+initial extraction; ignoring the directory does not rewrite old commits.
