@@ -159,12 +159,10 @@ class RotaryPositionalEmbedding(nn.Module):
         angle[pos, i] = pos * inv_freq[i]
         self.register_buffer("cos", angle.cos(), persistent=False)
         self.register_buffer("sin", angle.sin(), persistent=False)
-    persistent=False 很关键: 否则 cos/sin 会进 state_dict, 测试传进来的
-    weights 里没有这两个 key, load_state_dict 会报 missing keys。
 
     forward(x: (..., seq_len, d_k), token_positions: (..., seq_len)):
         用 token_positions 去索引 cos/sin, 对 x 的偶/奇维做旋转
-        (和你 adapters.run_rope 里的逻辑一样), 返回同形状张量。
+
     """
 
     def __init__(
@@ -208,9 +206,9 @@ class RotaryPositionalEmbedding(nn.Module):
 class CausalMultiHeadSelfAttention(nn.Module):
     """Causal MHA with RoPE on Q/K (handout §3.5.3).
 
-    属性名必须是 q_proj / k_proj / v_proj / output_proj, 各为 Linear(d_model, d_model)。
+    q_proj / k_proj / v_proj / output_proj, 各为 Linear(d_model, d_model)。
     rope: RotaryPositionalEmbedding(theta, d_k=d_model // num_heads, max_seq_len);
-          训练用的模型一定要 RoPE, 可以让 rope 为 Optional 方便做消融。
+
 
     forward(x: (..., seq_len, d_model), token_positions: (..., seq_len) | None):
         1. 投影后 reshape 成 (..., num_heads, seq_len, d_k)
@@ -344,7 +342,6 @@ class TransformerLM(nn.Module):
         lm_head: Linear(d_model, vocab_size)
 
     forward(in_indices: (batch, seq_len)) -> logits (batch, seq_len, vocab_size)
-    不要在这里做 softmax, cross_entropy 里面会算。
     """
 
     def __init__(
@@ -360,7 +357,7 @@ class TransformerLM(nn.Module):
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
-        
+
         self.vocab_size = vocab_size
         self.context_length = context_length
         self.d_model = d_model

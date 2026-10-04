@@ -30,6 +30,7 @@ def get_batch(
     batch_size: int,
     context_length: int,
     device: str | torch.device,
+    generator: torch.Generator | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Sample a batch of (input, target) from the dataset.
 
@@ -43,7 +44,7 @@ def get_batch(
         (input_ids, target_ids), each of shape (batch_size, context_length)
     """
     max_start = len(dataset) - context_length
-    starts = torch.randint(0, max_start, (batch_size,))
+    starts = torch.randint(0, max_start, (batch_size,), generator=generator)
     x = torch.stack([torch.from_numpy(dataset[s : s + context_length].copy()) for s in starts])
     y = torch.stack([torch.from_numpy(dataset[s + 1 : s + 1 + context_length].copy()) for s in starts])
     return x.to(device=device, dtype=torch.long), y.to(device=device, dtype=torch.long)

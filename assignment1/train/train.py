@@ -75,9 +75,13 @@ def evaluate(model: nn.Module, val_data: np.ndarray, args, device) -> float:
     model.eval()
     total_loss = 0.0
     num_eval_batches = args.eval_batches
+    batch_size = args.eval_batch_size or args.batch_size
+    generator = None
+    if args.eval_seed is not None:
+        generator = torch.Generator(device="cpu").manual_seed(args.eval_seed)
 
     for _ in range(num_eval_batches):
-        x, y = get_batch(val_data, args.batch_size, args.context_length, device)
+        x, y = get_batch(val_data, batch_size, args.context_length, device, generator=generator)
         logits = model(x)
         loss = cross_entropy(logits, y)
         total_loss += loss.item()
@@ -147,6 +151,12 @@ def main():
     # Evaluation & logging
     parser.add_argument("--eval_interval", type=int, default=500)
     parser.add_argument("--eval_batches", type=int, default=50)
+    parser.add_argument("--eval_batch_size", type=int, default=None,
+                        help="Validation batch size; defaults to training batch size")
+    parser.add_argument("--eval_seed", type=int, default=None,
+                        help="Use fixed validation windows without consuming training RNG")
+    parser.add_argument("--fail_on_nonfinite", action="store_true",
+                        help="Stop immediately if training loss becomes NaN or infinite")
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--sample_interval", type=int, default=1000)
@@ -165,6 +175,8 @@ def main():
     args = parser.parse_args()
     if args.probe_warmup_steps < 0:
         parser.error("--probe_warmup_steps must be nonnegative")
+    if args.eval_batch_size is not None and args.eval_batch_size <= 0:
+        parser.error("--eval_batch_size must be positive")
 
     # Setup distributed
     rank, world_size, local_rank = setup_ddp()
@@ -295,6 +307,8 @@ def main():
         with phase("forward_loss"):
             logits = model(x)
             loss = cross_entropy(logits, y)
+            if args.fail_on_nonfinite and not torch.isfinite(loss).item():
+                raise FloatingPointError(f"Non-finite training loss at iteration {iteration + 1}")
 
         # Backward
         with phase("backward"):

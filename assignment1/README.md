@@ -80,6 +80,7 @@ and [validation text](https://huggingface.co/datasets/roneneldan/TinyStories/blo
 
 ### Training configuration and measurements
 
+
 The run used batch size 16, 10,000 optimizer steps, peak learning rate `3e-4`,
 500 warmup steps, minimum learning-rate ratio 0.1, AdamW betas `(0.9, 0.95)`,
 weight decay 0.1, gradient clipping at 1.0 and seed 42. Validation ran every
@@ -167,23 +168,70 @@ CLI's `--vocab_path` / `--merges_path` loader does not support this format yet;
 training-time generation was disabled, and the samples above were generated
 after training by a separate checkpoint review script.
 
-## Independent Git management
+## Planned learning-rate / batch / warmup sweep
 
-Develop, commit and push from the sibling CS336 repository:
+`scripts/train_sweep.py` runs the full Cartesian product of learning rates
+`1e-4, 3e-4, 1e-3, 3e-3`, training batch sizes `16, 32, 64, 128`, and warmup
+fractions `0%, 1%, 3%, 5%`: 64 independent runs, with seed 42 and the same model.
+This sweep has not yet been executed; the measurements above are from the
+earlier batch-16 run.
+
+Each run processes exactly 40,960,000 training tokens at context length 256.
+Warmup fractions refer to optimizer steps and are rounded up to whole steps.
+
+| Batch size | Optimizer steps | Warmup steps for 0% / 1% / 3% / 5% |
+| --- | ---: | --- |
+| 16 | 10,000 | 0 / 100 / 300 / 500 |
+| 32 | 5,000 | 0 / 50 / 150 / 250 |
+| 64 | 2,500 | 0 / 25 / 75 / 125 |
+| 128 | 1,250 | 0 / 13 / 38 / 63 |
+
+Validation uses batch size 16, 50 batches and a dedicated CPU generator seeded
+with 1234 on every evaluation. Thus all runs use the same 204,800 validation
+tokens, independently of training RNG and training batch size. Each run has
+10 evaluations spaced by 4,096,000 training tokens. The schedule remains
+cosine decay to 10% of the configured peak learning rate. Training loss that
+becomes NaN or infinite aborts that run. Failed runs (including CUDA OOM) are
+recorded and do not prevent later configurations from running.
+
+Preview the plan without training:
 
 ```sh
-cd ../CS336
-git add -- assignment1
-git commit -m "Update Assignment 1 training code"
-git push
+conda run -n agent python scripts/train_sweep.py --plan-only
 ```
 
-These commands assume the starting directory is the Learn repository root.
-Configure a CS336 remote before pushing. Learn no longer tracks its local
-`learning_code/CS336/assignment1` copy, and pushing Learn does not publish new
-changes from that copy. The copies do not synchronize automatically.
+Start sequentially on AutoDL after copying the updated files there:
 
-The original subtree import and Learn `assignment1-core` branch remain as
-historical references. Do not use the former Learn subtree synchronization
-commands for ongoing development. Existing Learn history still contains the
-initial extraction; ignoring the directory does not rewrite old commits.
+```sh
+cd /root/autodl-tmp/CS336/assignment1
+conda run -n agent python -u scripts/train_sweep.py
+```
+
+`scripts/run.sh` is an AutoDL background launcher for this script. Copy it
+to the server and run `bash scripts/run.sh` from the assignment1 directory. It prints the log path,
+PID and a process-group stop command. No sweep is started by updating files.
+
+Outputs are in `outputs/sweep_tinystories_10k/`: `sweep_plan.json`, `summary.csv`,
+`best_run.json`, and separate attempt directories for each configuration.
+Completed runs are skipped on relaunch; interrupted runs restart from the
+beginning in a new attempt directory. Failed runs are skipped unless
+`--retry-failed` is supplied. The best run is ranked by final validation loss;
+the per-run minimum validation loss is also recorded. This tuning set does
+not provide an independent final test-set estimate.
+
+By default each successful run retains `model_weights.pt` containing model
+weights and iteration, and removes its full optimizer checkpoint. These
+weights support inference but not optimizer-state resume. All 64 models
+occupy roughly 10.4 GiB. Pass `--keep-optimizer-state` to retain full resumable
+`final_model.pt` files instead (roughly 32 GiB). Only the final checkpoint is
+saved per run, rather than 10 intermediate checkpoints.
+
+At the previously measured 54,300 training tokens/s, one run needs about
+12.6 minutes of training compute and 64 runs need about 13.4 hours; allow
+approximately 14 hours including startup, fixed validation and saving.
+This is a constant-throughput projection, not a measurement of the larger
+batches. Batch-dependent throughput, memory pressure and failed runs will
+change actual time. Batch 128 has not been validated on RTX 5090; its memory
+use and OOM status must be measured. The earlier runs also overlapped, so a
+single sequential sweep may have different throughput.
+

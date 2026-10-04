@@ -12,3 +12,5 @@ checkpoints/
 *.log
 .DS_Store
 .vscode
+
+run.sh
