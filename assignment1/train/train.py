@@ -241,8 +241,6 @@ def main():
     tokenizer = None
     if is_main and args.vocab_path and args.merges_path:
         try:
-            import json
-
             from train.tokenizer import Tokenizer
 
             with open(args.vocab_path) as f:

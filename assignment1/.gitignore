@@ -10,3 +10,4 @@ data/
 outputs/
 checkpoints/
 *.log
+.DS_Store

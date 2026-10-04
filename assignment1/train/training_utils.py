@@ -46,7 +46,7 @@ def get_batch(
     starts = torch.randint(0, max_start, (batch_size,))
     x = torch.stack([torch.from_numpy(dataset[s : s + context_length].copy()) for s in starts])
     y = torch.stack([torch.from_numpy(dataset[s + 1 : s + 1 + context_length].copy()) for s in starts])
-    return x.to(device), y.to(device)
+    return x.to(device=device, dtype=torch.long), y.to(device=device, dtype=torch.long)
 
 
 def softmax(x: Tensor, dim: int = -1) -> Tensor:
