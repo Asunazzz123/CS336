@@ -11,3 +11,4 @@ outputs/
 checkpoints/
 *.log
 .DS_Store
+.vscode
