@@ -26,10 +26,31 @@ conda run -n agent python scripts/inspect_tokenizer.py
 ```
 
 The extraction updates package imports and paths, preserving the current
-training algorithms. Previously identified training issues remain: the local
-json import inside main, uint16 batch conversion, tokenizer artifact loading
-and generation context management. This extraction is not a claim that full
-training has passed.
+training algorithms. Startup and uint16 batch conversion have been fixed.
+Tokenizer artifact loading and generation context management still need work.
+Full real-corpus training and multi-GPU validation have not been completed.
+
+## Single-device performance probes
+
+Single-device runs enable performance probes by default. The first five steps
+of each invocation are excluded from stable throughput measurements. Change
+this with `--probe_warmup_steps N`, or disable probes with `--disable_probe`.
+Warmup steps are real training updates and still count toward total tokens.
+
+The output directory receives `metrics.jsonl` (append-only events with run IDs)
+and `performance_summary.json` (latest invocation summary). Training logs report
+loss, learning rate used and next learning rate, total/session token counts,
+mean/std step time, tokens/s and mean phase times for data loading including
+transfer, forward/loss, backward including zero-grad, clipping and optimizer/
+scheduler. Validation, generation and checkpoint times are separate overheads.
+
+CUDA phase timings synchronize the selected device before and after each
+phase. This intentionally adds instrumentation overhead and prevents overlap
+between phases; disable probes to measure the uninstrumented training path.
+Peak allocated/reserved CUDA bytes cover measured training steps, excluding
+validation and generation. CPU runs report these memory fields as null.
+DDP runs do not enable these probes; local rank timing is not a distributed
+throughput benchmark. Resume starts a new measurement window and warmup.
 
 ## Independent Git management
 

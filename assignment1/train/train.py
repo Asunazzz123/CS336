@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +42,7 @@ from train.training_utils import (
     set_seed,
 )
 from train.optimizer import TinyAdamW
+from train.performance import PerformanceProbe
 
 
 def setup_ddp():
@@ -149,6 +151,10 @@ def main():
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--sample_interval", type=int, default=1000)
     parser.add_argument("--sample_prompt", type=str, default="Once upon a time")
+    parser.add_argument("--probe_warmup_steps", type=int, default=5,
+                        help="Initial steps excluded from single-device performance statistics")
+    parser.add_argument("--disable_probe", action="store_true",
+                        help="Disable synchronized phase timing and performance files")
 
     # Misc
     parser.add_argument("--output_dir", type=str, default="outputs")
@@ -157,6 +163,8 @@ def main():
     parser.add_argument("--compile", action="store_true", help="torch.compile model (needs PyTorch 2.0+)")
 
     args = parser.parse_args()
+    if args.probe_warmup_steps < 0:
+        parser.error("--probe_warmup_steps must be nonnegative")
 
     # Setup distributed
     rank, world_size, local_rank = setup_ddp()
@@ -255,66 +263,124 @@ def main():
     # Training loop
     log_print(rank, "Starting training...")
     model.train()
-    t0 = time.time()
+    probe = PerformanceProbe(device, args.probe_warmup_steps) if world_size == 1 and not args.disable_probe else None
+    run_id = time.time_ns()
+    metrics_path = Path(args.output_dir) / "metrics.jsonl"
+    run_started = time.perf_counter()
+    overhead_seconds = {"validation": 0.0, "checkpoint": 0.0, "generation": 0.0}
+
+    def write_metrics(event: str, **values):
+        if probe is not None:
+            record = {"event": event, "run_id": run_id,
+                      "elapsed_seconds": time.perf_counter() - run_started, **values}
+            with metrics_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record) + "\n")
+
+    write_metrics("start", device=str(device), device_name=torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU",
+                  torch_version=torch.__version__, num_params=num_params, start_iteration=start_iter,
+                  warmup_steps=args.probe_warmup_steps, tokens_per_step=args.batch_size * args.context_length,
+                  compile=args.compile, timing_mode="synchronized_phases")
 
     for iteration in range(start_iter, args.max_iters):
+        local_step = iteration - start_iter
+        timings = {}
+        step_started = probe.begin_step(local_step) if probe is not None else None
+        phase = lambda name: probe.phase(timings, name) if probe is not None else nullcontext()
+        lr_used = optimizer.param_groups[0]["lr"]
         # Get batch
-        x, y = get_batch(train_data, args.batch_size, args.context_length, device)
+        with phase("data_loading"):
+            x, y = get_batch(train_data, args.batch_size, args.context_length, device)
 
         # Forward
-        logits = model(x)
-        loss = cross_entropy(logits, y)
+        with phase("forward_loss"):
+            logits = model(x)
+            loss = cross_entropy(logits, y)
 
         # Backward
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        with phase("backward"):
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
 
         # Gradient clipping
-        if args.grad_clip > 0:
-            gradient_clipping(model.parameters(), args.grad_clip)
+        with phase("gradient_clipping"):
+            if args.grad_clip > 0:
+                gradient_clipping(model.parameters(), args.grad_clip)
 
         # Optimizer step
-        optimizer.step()
-        scheduler.step()
+        with phase("optimizer_scheduler"):
+            optimizer.step()
+            scheduler.step()
+        if probe is not None:
+            probe.end_step(step_started, local_step, x.numel(), timings)
 
         # Logging
-        if (iteration + 1) % args.log_interval == 0 and is_main:
-            elapsed = time.time() - t0
+        if ((iteration + 1) % args.log_interval == 0 or iteration + 1 == args.max_iters) and is_main:
             lr = optimizer.param_groups[0]["lr"]
+            stats = probe.summary() if probe is not None else {}
+            speed = (f" | step {stats['mean_step_seconds']:.4f}s | {stats['tokens_per_second']:.0f} tokens/s"
+                     if stats.get("measured_steps") else "")
             log_print(
                 rank,
                 f"iter {iteration + 1}/{args.max_iters} | "
                 f"loss {loss.item():.4f} | lr {lr:.2e} | "
-                f"{elapsed:.2f}s ({args.log_interval / elapsed:.2f} it/s)",
+                f"elapsed {time.perf_counter() - run_started:.2f}s{speed}",
             )
-            t0 = time.time()
+            write_metrics("train", iteration=iteration + 1, loss=loss.item(), lr_used=lr_used, next_lr=lr,
+                          total_tokens_processed=(iteration + 1) * args.batch_size * args.context_length,
+                          session_tokens_processed=(local_step + 1) * args.batch_size * args.context_length,
+                          **stats)
 
         # Evaluation
         if (iteration + 1) % args.eval_interval == 0 and is_main:
             raw_model = model.module if isinstance(model, DDP) else model
-            val_loss = evaluate(raw_model, val_data, args, device)
+            with phase("validation"):
+                val_loss = evaluate(raw_model, val_data, args, device)
+            overhead_seconds["validation"] += timings.get("validation", 0.0)
+            write_metrics("validation", iteration=iteration + 1, val_loss=val_loss,
+                          seconds=timings.get("validation"))
             log_print(rank, f"[Eval] iter {iteration + 1} | val_loss {val_loss:.4f}")
 
         # Generation sample
         if (iteration + 1) % args.sample_interval == 0 and is_main and tokenizer:
             raw_model = model.module if isinstance(model, DDP) else model
-            sample = generate_sample(
-                raw_model, tokenizer, args.sample_prompt, max_new_tokens=50, temperature=0.8, device=device
-            )
+            with phase("generation"):
+                sample = generate_sample(
+                    raw_model, tokenizer, args.sample_prompt, max_new_tokens=50, temperature=0.8, device=device
+                )
+            overhead_seconds["generation"] += timings.get("generation", 0.0)
+            write_metrics("generation", iteration=iteration + 1, seconds=timings.get("generation"))
             log_print(rank, f"[Sample] iter {iteration + 1}:\n{sample}\n")
 
         # Save checkpoint
         if (iteration + 1) % args.save_interval == 0 and is_main:
             ckpt_path = f"{args.output_dir}/checkpoint_{iteration + 1}.pt"
             raw_model = model.module if isinstance(model, DDP) else model
-            save_checkpoint(raw_model, optimizer, iteration + 1, ckpt_path)
+            with phase("checkpoint"):
+                save_checkpoint(raw_model, optimizer, iteration + 1, ckpt_path)
+            overhead_seconds["checkpoint"] += timings.get("checkpoint", 0.0)
+            write_metrics("checkpoint", iteration=iteration + 1, path=ckpt_path, seconds=timings.get("checkpoint"))
             log_print(rank, f"Saved checkpoint to {ckpt_path}")
 
     # Final save
     if is_main:
         final_path = f"{args.output_dir}/final_model.pt"
         raw_model = model.module if isinstance(model, DDP) else model
-        save_checkpoint(raw_model, optimizer, args.max_iters, final_path)
+        final_timings = {}
+        with probe.phase(final_timings, "checkpoint") if probe is not None else nullcontext():
+            save_checkpoint(raw_model, optimizer, args.max_iters, final_path)
+        overhead_seconds["checkpoint"] += final_timings.get("checkpoint", 0.0)
+        write_metrics("checkpoint", iteration=args.max_iters, path=final_path,
+                      seconds=final_timings.get("checkpoint"), final=True)
+        if probe is not None:
+            summary = {"run_id": run_id, "device": str(device), "start_iteration": start_iter,
+                       "final_iteration": args.max_iters,
+                       "total_tokens_processed": args.max_iters * args.batch_size * args.context_length,
+                       "session_tokens_processed": max(0, args.max_iters - start_iter) * args.batch_size * args.context_length,
+                       "session_wall_seconds": time.perf_counter() - run_started,
+                       "overhead_seconds": overhead_seconds, **probe.summary()}
+            with (Path(args.output_dir) / "performance_summary.json").open("w", encoding="utf-8") as stream:
+                json.dump(summary, stream, indent=2)
+            write_metrics("summary", **summary)
         log_print(rank, f"Training complete. Final model saved to {final_path}")
 
     cleanup_ddp()
