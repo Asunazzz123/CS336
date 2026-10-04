@@ -167,23 +167,3 @@ CLI's `--vocab_path` / `--merges_path` loader does not support this format yet;
 training-time generation was disabled, and the samples above were generated
 after training by a separate checkpoint review script.
 
-## Independent Git management
-
-Develop, commit and push from the sibling CS336 repository:
-
-```sh
-cd ../CS336
-git add -- assignment1
-git commit -m "Update Assignment 1 training code"
-git push
-```
-
-These commands assume the starting directory is the Learn repository root.
-Configure a CS336 remote before pushing. Learn no longer tracks its local
-`learning_code/CS336/assignment1` copy, and pushing Learn does not publish new
-changes from that copy. The copies do not synchronize automatically.
-
-The original subtree import and Learn `assignment1-core` branch remain as
-historical references. Do not use the former Learn subtree synchronization
-commands for ongoing development. Existing Learn history still contains the
-initial extraction; ignoring the directory does not rewrite old commits.
