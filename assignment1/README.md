@@ -100,6 +100,8 @@ Results below are grouped by batch size, with 16 learning-rate/warmup combinatio
 
 The sum of all 64 run durations is **29,405.41 seconds, approximately 8 hours 10 minutes**. Throughput improves substantially from batch size 16 to 32, then remains broadly similar at 64 and 128 while memory usage increases. Synchronized performance probes were enabled throughout this sweep, so reported throughput includes their overhead. Memory peaks cover measured training steps only.
 
+**Runtime hypothesis.** The higher runtime at batch size 16 may be largely driven by CPU-side kernel dispatch and frequent probe synchronization. The probes introduce approximately 12 explicit CUDA synchronizations per training step. With a fixed token budget, batch size 16 requires 10,000 steps, compared with 1,250 at batch size 128, resulting in eight times as many probe synchronization calls. The observed saturation of one CPU core alongside roughly 50–60% GPU utilization is consistent with substantial CPU-side overhead. This remains a hypothesis: a controlled comparison with probes disabled is needed to distinguish their contribution from eager kernel dispatch, the custom optimizer, and other synchronization points.
+
 ## Initial Baseline and Generation Quality
 
 Before the sweep, a baseline model was trained for 10,000 steps using learning rate `3e-4`, batch size 16, and 5% warmup. It also processed 40,960,000 tokens:
