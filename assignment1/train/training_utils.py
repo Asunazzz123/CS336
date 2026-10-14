@@ -2,6 +2,7 @@
 
 import math
 import os
+import warnings
 from collections.abc import Iterable
 
 import numpy as np
@@ -128,6 +129,9 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     iteration: int,
     path: str,
+    *,
+    scaler: torch.amp.GradScaler | None = None,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> None:
     """Save training checkpoint."""
     state = {
@@ -135,6 +139,10 @@ def save_checkpoint(
         "optimizer": optimizer.state_dict(),
         "iteration": iteration,
     }
+    if scaler is not None and scaler.is_enabled():
+        state["scaler"] = scaler.state_dict()
+    if scheduler is not None:
+        state["scheduler"] = scheduler.state_dict()
     torch.save(state, path)
 
 
@@ -143,9 +151,29 @@ def load_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: str | torch.device,
+    *,
+    scaler: torch.amp.GradScaler | None = None,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> int:
     """Load checkpoint and return iteration number."""
     checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
+    if scaler is not None and scaler.is_enabled():
+        if "scaler" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler"])
+        else:
+            warnings.warn("Checkpoint has no GradScaler state; starting with a fresh FP16 loss scale", stacklevel=2)
+    if scheduler is not None:
+        if "scheduler" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        else:
+            # Legacy FP32/BF16 runs updated once per iteration. The optimizer
+            # already holds the checkpoint's LR; align the scheduler counter
+            # without stepping it before the next optimizer update.
+            iteration = checkpoint["iteration"]
+            scheduler_state = scheduler.state_dict()
+            scheduler_state.update(last_epoch=iteration, _step_count=iteration + 1,
+                                   _last_lr=[group["lr"] for group in optimizer.param_groups])
+            scheduler.load_state_dict(scheduler_state)
     return checkpoint["iteration"]

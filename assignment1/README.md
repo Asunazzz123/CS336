@@ -2,7 +2,27 @@
 
 A custom Transformer language model was trained on TinyStories using an **NVIDIA GeForce RTX 5090 (32 GB)**. The experiments include a baseline run and a completed sweep of 64 hyperparameter configurations. Each sweep run processes exactly **40,960,000 training tokens** to compare learning rate, batch size, and warmup fraction under the same token budget.
 
-## Model and Dataset Size
+## Mixed-Precision Training Result
+
+The default training entry point, `scripts/train_mixed_precision.py`, uses **BF16 + FP32 automatic mixed precision (AMP)**. Precision is assigned as follows:
+
+| Computation or data | Precision |
+| --- | --- |
+| Q, K, V projections and the attention output projection | BF16 matrix multiplication |
+| Attention matrix multiplications: $QK^\top$ and $PV$ | BF16 matrix multiplication |
+| The three FFN linear layers, SiLU, and elementwise gating | BF16 |
+| Final LM head and output logits | BF16 |
+| RoPE rotation | FP32 internally, then cast back to BF16 |
+| RMSNorm and attention softmax | FP32 internally, then cast back to the input dtype |
+| Embedding outputs and residual additions | FP32 |
+| Cross-entropy loss | FP32, after converting logits to FP32 |
+| Parameter storage, final `param.grad` buffers, AdamW moment buffers, and parameter updates | FP32 |
+
+BF16 matrix multiplication refers to the operand and output dtypes; the internal accumulation precision depends on the backend kernel. Backward matrix multiplications use the dtypes selected for the corresponding forward operations, while final parameter gradients accumulate in FP32 buffers. In this implementation, RMSNorm receives and returns FP32 tensors, and attention softmax returns BF16 tensors.
+
+## FP32 Training Result
+
+### Model and Dataset Size
 
 | Property | Value |
 | --- | ---: |
@@ -23,7 +43,7 @@ The data comes from the [TinyStories V2 GPT4 training split](https://huggingface
 
 Each model processes a token budget equivalent to approximately **7.6%** of the training corpus token count. Training samples random windows, so this fraction does not represent a complete pass through that portion of the corpus.
 
-## Experimental Design and Training Budget
+### Experimental Design and Training Budget
 
 The full Cartesian product of learning rates, batch sizes, and warmup fractions contains **4 × 4 × 4 = 64 independent runs**. All 64 runs completed successfully.
 
@@ -48,7 +68,7 @@ All other settings remain fixed: FP32 training, AdamW betas `(0.9, 0.95)`, weigh
 
 Each run has 10 evaluations, spaced by 4,096,000 training tokens. An evaluation uses 50 batches of size 16, totaling **204,800 validation tokens**. The same fixed windows are used across all runs and evaluations, and validation sampling does not consume the training RNG state. These losses estimate performance on that fixed validation sample, not the entire validation corpus.
 
-## Best Training Result
+### Best Training Result
 
 Among the 64 tested configurations, the lowest final validation loss was obtained with:
 
@@ -67,13 +87,13 @@ Among the 64 tested configurations, the lowest final validation loss was obtaine
 
 The following plots use this configuration as the baseline. Each panel varies one hyperparameter while holding the other two at their best values. All curves use the same training-token budget.
 
-### Validation Loss Curves
+#### Validation Loss Curves
 
 The horizontal axis measures processed training tokens, allowing comparison across different batch sizes and update counts. Curves show unsmoothed measurements.
 
 ![Validation loss over training tokens, with other variables fixed at their best values](result/figures/validation_learning_curves.png)
 
-### Final Validation Loss versus Hyperparameters
+#### Final Validation Loss versus Hyperparameters
 
 Within these conditional slices, increasing learning rate, batch size, and warmup fraction reduced final validation loss. The three panels use separate vertical-axis ranges, and each point is labeled with its loss.
 
@@ -81,13 +101,13 @@ Within these conditional slices, increasing learning rate, batch size, and warmu
 
 These are conditional slices through the best configuration; they do not establish that hyperparameter interactions are absent. The best configuration lies at the boundary of the tested range, so conclusions apply only to the tested candidates. The result is also selected on the tuning validation set, rather than evaluated on an independent test set.
 
-### Training Loss Curves
+#### Training Loss Curves
 
 The following plots show unsmoothed losses from individual training batches. Fluctuation levels differ with batch size; training quality should also be assessed using the fixed-sample validation losses.
 
 ![Training batch loss over training tokens, with other variables fixed at their best values](result/figures/training_learning_curves.png)
 
-## Runtime and Memory
+### Runtime and Memory
 
 Results below are grouped by batch size, with 16 learning-rate/warmup combinations per row. Run duration includes training, validation, and result saving. Throughput measures training steps only.
 
@@ -102,7 +122,7 @@ The sum of all 64 run durations is **29,405.41 seconds, approximately 8 hours 10
 
 **Runtime hypothesis.** The higher runtime at batch size 16 may be largely driven by CPU-side kernel dispatch and frequent probe synchronization. The probes introduce approximately 12 explicit CUDA synchronizations per training step. With a fixed token budget, batch size 16 requires 10,000 steps, compared with 1,250 at batch size 128, resulting in eight times as many probe synchronization calls. The observed saturation of one CPU core alongside roughly 50–60% GPU utilization is consistent with substantial CPU-side overhead. This remains a hypothesis: a controlled comparison with probes disabled is needed to distinguish their contribution from eager kernel dispatch, the custom optimizer, and other synchronization points.
 
-## Initial Baseline and Generation Quality
+### Initial Baseline and Generation Quality
 
 Before the sweep, a baseline model was trained for 10,000 steps using learning rate `3e-4`, batch size 16, and 5% warmup. It also processed 40,960,000 tokens:
 

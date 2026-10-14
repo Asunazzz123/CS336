@@ -144,7 +144,8 @@ class SwiGLU(nn.Module):
         # raise NotImplementedError
 
     def Silu(self, input: Tensor) -> Tensor:
-        return torch.div(input,1+torch.exp(-input))
+        # sigmoid avoids exp(-x) overflow (and NaN gradients) in FP16.
+        return input * torch.sigmoid(input)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.w2(self.Silu(self.w1(x)) * self.w3(x))

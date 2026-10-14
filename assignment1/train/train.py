@@ -43,6 +43,7 @@ from train.training_utils import (
 )
 from train.optimizer import TinyAdamW
 from train.performance import PerformanceProbe
+from train.precision import MixedPrecision
 
 
 def setup_ddp():
@@ -70,7 +71,7 @@ def log_print(rank: int, *args, **kwargs):
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, val_data: np.ndarray, args, device) -> float:
+def evaluate(model: nn.Module, val_data: np.ndarray, args, device, precision=None) -> float:
     """Compute validation loss over a fixed number of batches."""
     model.eval()
     total_loss = 0.0
@@ -82,14 +83,16 @@ def evaluate(model: nn.Module, val_data: np.ndarray, args, device) -> float:
 
     for _ in range(num_eval_batches):
         x, y = get_batch(val_data, batch_size, args.context_length, device, generator=generator)
-        logits = model(x)
-        loss = cross_entropy(logits, y)
+        with precision.autocast() if precision is not None else nullcontext():
+            logits = model(x)
+        loss = cross_entropy(logits.float(), y)
         total_loss += loss.item()
 
     model.train()
     return total_loss / num_eval_batches
 
 
+@torch.no_grad()
 def generate_sample(
     model: nn.Module,
     tokenizer,
@@ -97,6 +100,7 @@ def generate_sample(
     max_new_tokens: int,
     temperature: float,
     device,
+    precision=None,
 ) -> str:
     """Generate text continuation (greedy or temperature sampling)."""
     model.eval()
@@ -104,8 +108,9 @@ def generate_sample(
     input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
 
     for _ in range(max_new_tokens):
-        logits = model(input_ids)  # (1, seq_len, vocab_size)
-        next_token_logits = logits[0, -1, :] / temperature
+        with precision.autocast() if precision is not None else nullcontext():
+            logits = model(input_ids)  # (1, seq_len, vocab_size)
+        next_token_logits = logits[0, -1, :].float() / temperature
         probs = torch.softmax(next_token_logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
         input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
@@ -119,7 +124,7 @@ def generate_sample(
     return tokenizer.decode(generated_ids)
 
 
-def main():
+def main(default_precision="fp32", default_output_dir="outputs"):
     parser = argparse.ArgumentParser(description="Train Transformer LM")
 
     # Data
@@ -147,6 +152,8 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_iters", type=int, default=500)
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
+    parser.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default=default_precision,
+                        help="Autocast precision; weights, gradients and optimizer state remain FP32")
 
     # Evaluation & logging
     parser.add_argument("--eval_interval", type=int, default=500)
@@ -167,7 +174,7 @@ def main():
                         help="Disable synchronized phase timing and performance files")
 
     # Misc
-    parser.add_argument("--output_dir", type=str, default="outputs")
+    parser.add_argument("--output_dir", type=str, default=default_output_dir)
     parser.add_argument("--resume_from", type=str, help="Resume from checkpoint path")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--compile", action="store_true", help="torch.compile model (needs PyTorch 2.0+)")
@@ -191,6 +198,12 @@ def main():
             raise RuntimeError("DDP requires CUDA")
 
     log_print(rank, f"[Rank {rank}/{world_size}] Using device: {device}")
+    try:
+        precision = MixedPrecision(device, args.precision)
+    except ValueError as error:
+        cleanup_ddp()
+        parser.error(str(error))
+    log_print(rank, f"Training precision: {args.precision} (FP32 parameters; loss scaling: {precision.scaler.is_enabled()})")
 
     # Create output directory
     if is_main:
@@ -218,6 +231,7 @@ def main():
         d_ff=args.d_ff,
         rope_theta=args.rope_theta,
         device=device,
+        dtype=torch.float32,
     )
 
     if args.compile and hasattr(torch, "compile"):
@@ -251,10 +265,8 @@ def main():
     if args.resume_from:
         log_print(rank, f"Resuming from {args.resume_from}")
         raw_model = model.module if isinstance(model, DDP) else model
-        start_iter = load_checkpoint(args.resume_from, raw_model, optimizer, device)
-        # Fast-forward scheduler
-        for _ in range(start_iter):
-            scheduler.step()
+        start_iter = load_checkpoint(args.resume_from, raw_model, optimizer, device,
+                                     scaler=precision.scaler, scheduler=scheduler)
         log_print(rank, f"Resumed at iteration {start_iter}")
 
     # Optional tokenizer for generation
@@ -291,7 +303,7 @@ def main():
     write_metrics("start", device=str(device), device_name=torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU",
                   torch_version=torch.__version__, num_params=num_params, start_iteration=start_iter,
                   warmup_steps=args.probe_warmup_steps, tokens_per_step=args.batch_size * args.context_length,
-                  compile=args.compile, timing_mode="synchronized_phases")
+                  compile=args.compile, precision=args.precision, timing_mode="synchronized_phases")
 
     for iteration in range(start_iter, args.max_iters):
         local_step = iteration - start_iter
@@ -305,25 +317,26 @@ def main():
 
         # Forward
         with phase("forward_loss"):
-            logits = model(x)
-            loss = cross_entropy(logits, y)
+            with precision.autocast():
+                logits = model(x)
+            loss = cross_entropy(logits.float(), y)
             if args.fail_on_nonfinite and not torch.isfinite(loss).item():
                 raise FloatingPointError(f"Non-finite training loss at iteration {iteration + 1}")
 
         # Backward
         with phase("backward"):
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            precision.backward(loss)
 
         # Gradient clipping
         with phase("gradient_clipping"):
+            precision.unscale_(optimizer)
             if args.grad_clip > 0:
                 gradient_clipping(model.parameters(), args.grad_clip)
 
         # Optimizer step
         with phase("optimizer_scheduler"):
-            optimizer.step()
-            scheduler.step()
+            optimizer_updated = precision.step(optimizer, scheduler)
         if probe is not None:
             probe.end_step(step_started, local_step, x.numel(), timings)
 
@@ -340,6 +353,7 @@ def main():
                 f"elapsed {time.perf_counter() - run_started:.2f}s{speed}",
             )
             write_metrics("train", iteration=iteration + 1, loss=loss.item(), lr_used=lr_used, next_lr=lr,
+                          optimizer_updated=optimizer_updated, loss_scale=precision.scaler.get_scale(),
                           total_tokens_processed=(iteration + 1) * args.batch_size * args.context_length,
                           session_tokens_processed=(local_step + 1) * args.batch_size * args.context_length,
                           **stats)
@@ -348,7 +362,7 @@ def main():
         if (iteration + 1) % args.eval_interval == 0 and is_main:
             raw_model = model.module if isinstance(model, DDP) else model
             with phase("validation"):
-                val_loss = evaluate(raw_model, val_data, args, device)
+                val_loss = evaluate(raw_model, val_data, args, device, precision)
             overhead_seconds["validation"] += timings.get("validation", 0.0)
             write_metrics("validation", iteration=iteration + 1, val_loss=val_loss,
                           seconds=timings.get("validation"))
@@ -359,7 +373,8 @@ def main():
             raw_model = model.module if isinstance(model, DDP) else model
             with phase("generation"):
                 sample = generate_sample(
-                    raw_model, tokenizer, args.sample_prompt, max_new_tokens=50, temperature=0.8, device=device
+                    raw_model, tokenizer, args.sample_prompt, max_new_tokens=50, temperature=0.8, device=device,
+                    precision=precision,
                 )
             overhead_seconds["generation"] += timings.get("generation", 0.0)
             write_metrics("generation", iteration=iteration + 1, seconds=timings.get("generation"))
@@ -370,7 +385,8 @@ def main():
             ckpt_path = f"{args.output_dir}/checkpoint_{iteration + 1}.pt"
             raw_model = model.module if isinstance(model, DDP) else model
             with phase("checkpoint"):
-                save_checkpoint(raw_model, optimizer, iteration + 1, ckpt_path)
+                save_checkpoint(raw_model, optimizer, iteration + 1, ckpt_path,
+                                scaler=precision.scaler, scheduler=scheduler)
             overhead_seconds["checkpoint"] += timings.get("checkpoint", 0.0)
             write_metrics("checkpoint", iteration=iteration + 1, path=ckpt_path, seconds=timings.get("checkpoint"))
             log_print(rank, f"Saved checkpoint to {ckpt_path}")
@@ -381,12 +397,14 @@ def main():
         raw_model = model.module if isinstance(model, DDP) else model
         final_timings = {}
         with probe.phase(final_timings, "checkpoint") if probe is not None else nullcontext():
-            save_checkpoint(raw_model, optimizer, args.max_iters, final_path)
+            save_checkpoint(raw_model, optimizer, args.max_iters, final_path,
+                            scaler=precision.scaler, scheduler=scheduler)
         overhead_seconds["checkpoint"] += final_timings.get("checkpoint", 0.0)
         write_metrics("checkpoint", iteration=args.max_iters, path=final_path,
                       seconds=final_timings.get("checkpoint"), final=True)
         if probe is not None:
             summary = {"run_id": run_id, "device": str(device), "start_iteration": start_iter,
+                       "precision": args.precision,
                        "final_iteration": args.max_iters,
                        "total_tokens_processed": args.max_iters * args.batch_size * args.context_length,
                        "session_tokens_processed": max(0, args.max_iters - start_iter) * args.batch_size * args.context_length,
