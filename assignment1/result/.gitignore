@@ -1,2 +1,3 @@
 sweep_tinystories_10k/*
+sweep_tinystories_10k_bf16/*
 figures/*.svg
