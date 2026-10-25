@@ -8,6 +8,7 @@ import re
 import sys
 import socket
 import time
+from contextlib import nullcontext
 from decimal import Decimal, InvalidOperation
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -47,6 +48,7 @@ class TrainConfig:
     eval_examples: int = 4
     save_every: int = 1
     optimizer_name: str = "adamw"
+    optimizer_device: str = "model"
     weight_decay: float = 0.0
     dtype: str = "float32"
     sampling_strategy: str = "random"
@@ -55,6 +57,15 @@ class TrainConfig:
     vllm_host: str = "127.0.0.1"
     vllm_port: int = 8000
     vllm_gpu: int = 1
+    # 默认优势只减组均值，loss 按本次更新的全批 response token 数平均。
+    # 与旧实验的 std/sequence 不同；可用 CLI 显式恢复旧目标。
+    advantage_normalizer: str = "none"
+    loss_normalization: str = "constant"
+    # 配合 --dtype float32 实现 FP32 主权重 + BF16 autocast 计算，
+    # 使 lr~1e-6 量级的更新不被 BF16 舍入吞掉
+    autocast: str = "none"
+    gradient_checkpointing: bool = False
+    save_optimizer_state: bool = True
 
 
 @dataclass
@@ -103,9 +114,95 @@ class CombinedOptimizer:
             optimizer.load_state_dict(saved)
 
 
+class CPUOffloadOptimizer:
+    """Adam/AdamW with FP32 CPU masters and moments, and live model parameters.
+
+    Gradients are clipped/accumulated on the model device by the caller. Each
+    step copies those gradients to CPU, updates the masters, then copies the
+    updated parameters back. Copies are synchronous so the next forward sees
+    the completed update. This saves GPU optimizer memory at a transfer cost.
+    """
+
+    def __init__(self, params, optimizer_name: str, **kwargs):
+        if optimizer_name not in ("adam", "adamw"):
+            raise ValueError("CPU optimizer offload only supports adam/adamw")
+        self.model_parameters = list({id(p): p for p in params}.values())
+        self.master_parameters = [
+            torch.nn.Parameter(p.detach().to(device="cpu", dtype=torch.float32, copy=True),
+                               requires_grad=True)
+            for p in self.model_parameters
+        ]
+        self.optimizer_name = optimizer_name
+        optimizer_class = torch.optim.Adam if optimizer_name == "adam" else torch.optim.AdamW
+        # A parameter-sized foreach temporary is expensive for a large model.
+        self.optimizer = optimizer_class(self.master_parameters, foreach=False, **kwargs)
+
+    @property
+    def param_groups(self):
+        # Return the actual groups, including after load_state_dict replaces them.
+        return self.optimizer.param_groups
+
+    @torch.no_grad()
+    def step(self):
+        for parameter, master in zip(self.model_parameters, self.master_parameters):
+            master.grad = (
+                None if parameter.grad is None else
+                parameter.grad.detach().to(device="cpu", dtype=torch.float32, copy=True)
+            )
+        result = self.optimizer.step()
+        for parameter, master in zip(self.model_parameters, self.master_parameters):
+            parameter.copy_(master)
+        return result
+
+    def zero_grad(self, set_to_none=True):
+        self.optimizer.zero_grad(set_to_none=set_to_none)
+        for parameter in self.model_parameters:
+            if parameter.grad is not None:
+                if set_to_none:
+                    parameter.grad = None
+                else:
+                    if parameter.grad.grad_fn is not None:
+                        parameter.grad.detach_()
+                    else:
+                        parameter.grad.requires_grad_(False)
+                    parameter.grad.zero_()
+
+    def state_dict(self):
+        # Masters are needed for exact FP32 optimizer continuation: model export
+        # may be BF16 even when live training parameters are FP32.
+        return {
+            "optimizer_name": self.optimizer_name,
+            "master_parameters": [p.detach() for p in self.master_parameters],
+            "optimizer": self.optimizer.state_dict(),
+        }
+
+    @torch.no_grad()
+    def load_state_dict(self, state):
+        if state.get("optimizer_name") != self.optimizer_name:
+            raise ValueError("CPU optimizer type does not match checkpoint")
+        saved_parameters = state["master_parameters"]
+        if len(saved_parameters) != len(self.master_parameters):
+            raise ValueError("CPU master parameter count does not match checkpoint")
+        for master, saved in zip(self.master_parameters, saved_parameters):
+            if master.shape != saved.shape:
+                raise ValueError("CPU master parameter shape does not match checkpoint")
+        self.optimizer.load_state_dict(state["optimizer"])
+        for parameter, master, saved in zip(
+            self.model_parameters, self.master_parameters, saved_parameters
+        ):
+            master.copy_(saved)
+            parameter.copy_(master)
+        self.zero_grad(set_to_none=True)
+
+
 def optimizer_switcher(model, config):
     params = [p for p in model.parameters() if p.requires_grad]
     kwargs = dict(lr=config.learning_rate, weight_decay=config.weight_decay)
+    optimizer_device = getattr(config, "optimizer_device", "model")
+    if optimizer_device == "cpu":
+        return CPUOffloadOptimizer(params, config.optimizer_name, **kwargs)
+    if optimizer_device != "model":
+        raise ValueError(f"未知优化器设备：{optimizer_device}")
     if config.optimizer_name == "adam":
         return torch.optim.Adam(params, **kwargs)
     if config.optimizer_name == "adamw":
@@ -133,6 +230,17 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def autocast_context(model: torch.nn.Module, autocast: str):
+    """FP32 主权重 + BF16 autocast 前向的混合精度入口，仅在 CUDA 上生效。"""
+    if autocast == "none":
+        return nullcontext()
+    if autocast != "bfloat16":
+        raise ValueError(f"未知 autocast 类型：{autocast}")
+    if next(model.parameters()).device.type != "cuda":
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 
 def load_questions(path: Path) -> list[Question]:
@@ -179,6 +287,9 @@ def build_runtime(config: TrainConfig) -> Runtime:
     model.config.pad_token_id = tokenizer.pad_token_id
     model.generation_config.pad_token_id = tokenizer.pad_token_id
     model.generation_config.eos_token_id = tokenizer.eos_token_id
+    if config.gradient_checkpointing:
+        # 只在 train 模式下生效；train_on_rollouts 在开启检查点时会切到 train 模式
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     optimizer = optimizer_switcher(model, config)
     # 2. Transformers 复用模型；vLLM 在另一块 CUDA GPU 上生成
     if config.generation_backend == "transformers":
@@ -205,6 +316,10 @@ def build_runtime(config: TrainConfig) -> Runtime:
         server.process = vllm_utils.start_server(
             config.model_id, config.vllm_host, config.vllm_port,
             config.vllm_gpu, config.seed, "auto", "ERROR",
+            gpu_memory_utilization=server.gpu_memory_utilization,
+            max_model_len=server.max_model_len,
+            max_num_seqs=server.max_num_seqs,
+            enforce_eager=server.enforce_eager,
         )
         vllm_utils.wait_for_server(server.base_url, server.process, server.startup_timeout)
         server.init_weight_sync(str(device))
@@ -271,7 +386,8 @@ def generate_rollouts(runtime, questions, template, config) -> RolloutBatch:
                                   pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
                     if config.temperature > 0:
                         kwargs.update(temperature=config.temperature, top_k=0, top_p=1.0)
-                    generated = runtime.generator.generate(**inputs, **kwargs)
+                    with autocast_context(runtime.model, config.autocast):
+                        generated = runtime.generator.generate(**inputs, **kwargs)
                     # 3. 只解码新 token，不把 prompt 当作回答
                     for row in generated[:, width:]:
                         text = tokenizer.decode(row, skip_special_tokens=True)
@@ -329,9 +445,10 @@ def numeric_reward(response, ground_truth):
 
 
 def train_on_rollouts(runtime, rollouts, config):
-    # eval 关闭 dropout，但仍保留梯度；让打分与生成使用同一策略
+    # 打分与生成使用同一策略；eval 关闭 dropout（Qwen3.5 attention_dropout=0，
+    # 与 train 无行为差异）但保留梯度。梯度检查点只在 train 模式下生效。
     previous_mode = runtime.model.training
-    runtime.model.eval()
+    runtime.model.train(bool(config.gradient_checkpointing))
     try:
         return run_grpo_train_step(
             model=runtime.model, tokenizer=runtime.tokenizer, optimizer=runtime.optimizer,
@@ -340,6 +457,9 @@ def train_on_rollouts(runtime, rollouts, config):
             repeated_prompts=rollouts.repeated_prompts, rollout_responses=rollouts.responses,
             repeated_ground_truths=rollouts.repeated_ground_truths, group_size=config.group_size,
             importance_reweighting_method="none",
+            advantage_normalizer=config.advantage_normalizer,
+            loss_normalization=config.loss_normalization,
+            autocast_dtype=torch.bfloat16 if config.autocast == "bfloat16" else None,
         )
     finally:
         runtime.model.train(previous_mode)
@@ -388,16 +508,59 @@ def log_metrics(output_dir, step, split, metrics):
     print(json.dumps({k: v for k, v in record.items() if k != "examples"}, ensure_ascii=False, allow_nan=False), flush=True)
 
 
+def _bf16_cpu_state_dict(model):
+    """Export floating weights on CPU without breaking identical tied views."""
+    exported = {}
+    converted_views = {}
+    for name, value in model.state_dict().items():
+        # state_dict returns distinct Tensor objects for tied names. Cache their
+        # complete view identity, rather than the Python object or storage alone.
+        view = (value.device, value.dtype, value.untyped_storage().data_ptr(),
+                value.storage_offset(), tuple(value.shape), tuple(value.stride()))
+        if view not in converted_views:
+            dtype = torch.bfloat16 if value.is_floating_point() else value.dtype
+            converted_views[view] = value.detach().to(device="cpu", dtype=dtype, copy=True)
+        exported[name] = converted_views[view]
+    return exported
+
+
+def _save_bf16_model(model, destination):
+    """Write BF16 model files while leaving live parameters/config untouched."""
+    from copy import deepcopy
+
+    state = _bf16_cpu_state_dict(model)
+    live_config = model.config
+    live_generation_config = getattr(model, "generation_config", None)
+    export_config = deepcopy(live_config)
+    export_generation_config = deepcopy(live_generation_config)
+    try:
+        model.config = export_config
+        if live_generation_config is not None:
+            model.generation_config = export_generation_config
+        model.save_pretrained(destination, state_dict=state)
+        # Transformers infers config.dtype from the live FP32 parameters during
+        # save_pretrained, even when the supplied state_dict contains BF16.
+        model.config.dtype = torch.bfloat16
+        model.config.save_pretrained(destination)
+    finally:
+        model.config = live_config
+        if live_generation_config is not None:
+            model.generation_config = live_generation_config
+
+
 def save_checkpoint(runtime, config, step):
     destination = config.output_dir / f"checkpoint-{step:06d}"
     destination.mkdir(parents=True, exist_ok=False)
-    runtime.model.save_pretrained(destination)
+    # BF16 导出在 CPU 上完成；训练中的 FP32 主权重和配置保持原样。
+    _save_bf16_model(runtime.model, destination)
     runtime.tokenizer.save_pretrained(destination)
-    torch.save({"step": step, "optimizer": runtime.optimizer.state_dict(),
-                "torch_rng": torch.get_rng_state(), "python_rng": random.getstate(),
-                "numpy_rng": np.random.get_state(),
-                "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []},
-               destination / "training_state.pt")
+    training_state = {"step": step,
+                      "torch_rng": torch.get_rng_state(), "python_rng": random.getstate(),
+                      "numpy_rng": np.random.get_state(),
+                      "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []}
+    if getattr(config, "save_optimizer_state", True):
+        training_state["optimizer"] = runtime.optimizer.state_dict()
+    torch.save(training_state, destination / "training_state.pt")
     (destination / "config.json.run").write_text(json.dumps(json_value(asdict(config)), indent=2), encoding="utf-8")
 
 
@@ -471,11 +634,25 @@ def parse_args():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--generation-backend", choices=["transformers", "vllm"], default="transformers")
     parser.add_argument("--optimizer-name", choices=["adam", "adamw", "muon"], default="adamw")
+    parser.add_argument("--optimizer-device", choices=["model", "cpu"], default="model",
+                        help="cpu 将 Adam/AdamW 的 FP32 主权重与优化器状态放在 CPU，减少显存占用")
     parser.add_argument("--dtype", choices=["float32", "bfloat16", "float16"], default="float32")
     parser.add_argument("--sampling-strategy", choices=["random", "order"], default="random")
     parser.add_argument("--reward-type", choices=["gsm8k_numeric", "r1_zero", "question_only"], default="gsm8k_numeric")
+    parser.add_argument("--advantage-normalizer", choices=["std", "none", "mean"], default="none",
+                        help="none 只减组均值；std 另除组内标准差；mean 另除组均值")
+    parser.add_argument("--loss-normalization", choices=["sequence", "constant"], default="constant",
+                        help="constant 按本批回答 token 总数平均；sequence 先逐回答平均再按批平均")
+    parser.add_argument("--autocast", choices=["none", "bfloat16"], default="none",
+                        help="建议配合 --dtype float32：FP32 主权重 + BF16 autocast 计算")
+    parser.add_argument("--gradient-checkpointing", action="store_true",
+                        help="以重算换显存；开启后更新阶段使用 train 模式")
+    parser.add_argument("--no-save-optimizer-state", dest="save_optimizer_state", action="store_false",
+                        help="checkpoint 不保存优化器状态（磁盘紧张时用）")
     parser.add_argument("--vllm-host", default="127.0.0.1")
     args = parser.parse_args()
+    if args.optimizer_device == "cpu" and args.optimizer_name == "muon":
+        parser.error("CPU optimizer offload only supports adam/adamw")
     for name in ("num_steps", "prompts_per_batch", "group_size", "gradient_accumulation_steps", "max_new_tokens",
                  "eval_every", "eval_examples", "save_every", "generation_batch_size"):
         if getattr(args, name) <= 0:

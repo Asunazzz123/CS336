@@ -12,5 +12,7 @@ checkpoints/
 *.log
 .DS_Store
 .vscode
-
+.claude
+notes
+docs/
 run.sh

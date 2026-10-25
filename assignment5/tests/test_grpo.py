@@ -49,6 +49,57 @@ def test_get_response_log_probs(numpy_snapshot, model, input_ids, labels):
     numpy_snapshot.assert_match(output)
 
 
+def test_logged_entropy_preserves_policy_gradients(tiny_train_model, tokenizer):
+    tiny_train_model.eval()
+    batch = tokenize_prompt_and_output(
+        prompt_strs=["Hello", "This is"],
+        output_strs=["world", "another test"],
+        tokenizer=tokenizer,
+    )
+    advantages = torch.tensor([1.0, -0.5])
+    reference_loss = None
+    reference_gradients = None
+
+    for return_token_entropy in (False, True):
+        tiny_train_model.zero_grad(set_to_none=True)
+        output = get_response_log_probs(
+            model=tiny_train_model,
+            input_ids=batch["input_ids"],
+            labels=batch["labels"],
+            return_token_entropy=return_token_entropy,
+        )
+        assert output["log_probs"].requires_grad
+        if return_token_entropy:
+            assert not output["token_entropy"].requires_grad
+            assert output["token_entropy"].grad_fn is None
+
+        per_token_loss, _ = compute_policy_gradient_loss(
+            raw_rewards_or_advantages=advantages,
+            policy_log_probs=output["log_probs"],
+            importance_reweighting_method="none",
+        )
+        loss = aggregate_loss_across_microbatch(
+            per_token_policy_gradient_loss=per_token_loss,
+            mask=batch["response_mask"],
+            loss_normalization="sequence",
+        )
+        loss.backward()
+        gradients = {
+            name: param.grad.detach().clone()
+            for name, param in tiny_train_model.named_parameters()
+            if param.grad is not None
+        }
+        assert any(torch.count_nonzero(grad) for grad in gradients.values())
+        if reference_gradients is None:
+            reference_loss = loss.detach().clone()
+            reference_gradients = gradients
+        else:
+            torch.testing.assert_close(loss.detach(), reference_loss)
+            assert gradients.keys() == reference_gradients.keys()
+            for name, gradient in gradients.items():
+                torch.testing.assert_close(gradient, reference_gradients[name])
+
+
 def test_compute_rollout_rewards(numpy_snapshot, reward_fn, rollout_responses, repeated_ground_truths):
     raw_rewards, _ = compute_rollout_rewards(
         reward_fn=reward_fn,
@@ -216,6 +267,37 @@ def _train_step_reward_fn(response: str, ground_truth: str) -> dict[str, float]:
         "format_reward": float(reward > 0),
         "answer_reward": reward,
     }
+
+
+def test_auto_token_average_matches_full_batch_and_accumulation(tiny_train_model, tokenizer):
+    from copy import deepcopy
+    from alignment.grpo import run_grpo_train_step
+
+    prompts, responses, ground_truths, _ = _train_step_inputs(tokenizer)
+    tokenized = tokenize_prompt_and_output(prompts, responses, tokenizer)
+    token_counts = tokenized["response_mask"].sum(dim=1)
+    assert token_counts.unique().numel() > 1
+    total_tokens = int(token_counts.sum())
+    results = []
+    for accumulation, denominator in ((1, total_tokens), (2, None), (4, None)):
+        model = deepcopy(tiny_train_model).eval()
+        loss, metadata = run_grpo_train_step(
+            model=model, tokenizer=tokenizer,
+            optimizer=_train_step_optimizer(model),
+            gradient_accumulation_steps=accumulation,
+            max_grad_norm=None, reward_fn=_train_step_reward_fn,
+            repeated_prompts=prompts, rollout_responses=responses,
+            repeated_ground_truths=ground_truths, group_size=2,
+            advantage_normalizer="none", loss_normalization="constant",
+            normalization_constant=denominator,
+        )
+        assert metadata["response_tokens"] == total_tokens
+        results.append((loss, dict(model.named_parameters())))
+    reference_loss, reference_parameters = results[0]
+    for loss, parameters in results[1:]:
+        torch.testing.assert_close(loss, reference_loss)
+        for name in parameters:
+            torch.testing.assert_close(parameters[name], reference_parameters[name])
 
 
 def test_grpo_train_step_standard_on_policy(numpy_snapshot, tiny_train_model, tokenizer):

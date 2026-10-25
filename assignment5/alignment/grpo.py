@@ -1,5 +1,6 @@
 """GRPO helpers shared by training and test adapters."""
 from __future__ import annotations
+from contextlib import nullcontext
 from typing import Callable, Literal
 import torch
 from torch import Tensor
@@ -118,6 +119,7 @@ def run_get_response_log_probs(
     input_ids: torch.Tensor,
     labels: torch.Tensor,
     return_token_entropy: bool,
+    autocast_dtype: torch.dtype | None = None,
 ) -> dict[str, torch.Tensor]:
     """Get per-token conditional log-probabilities (given the previous tokens)
     from a causal language model, and optionally the entropy of the model's
@@ -134,7 +136,12 @@ def run_get_response_log_probs(
             shape (batch_size, sequence_length), labels as produced by your
             tokenization method.
         return_token_entropy: bool
-            If True, also return per-token entropy.
+            If True, also return per-token entropy as a non-differentiable
+            diagnostic.
+        autocast_dtype: torch.dtype | None
+            If set (e.g. torch.bfloat16) and the tensors are on CUDA, run the
+            forward pass under torch.autocast. Combined with FP32 parameters
+            this gives mixed precision: FP32 master weights with BF16 compute.
 
     Returns:
         dict[str, torch.Tensor].
@@ -144,41 +151,41 @@ def run_get_response_log_probs(
             "token_entropy"
                 optional, shape (batch_size, sequence_length), per-token
                 entropy for each position (present only if
-                return_token_entropy=True).
+                return_token_entropy=True). These diagnostic values do not
+                retain an autograd graph.
     """
     # 前向传播, 输出的Tensor 是 [Batch,Sequence,Token]
     pad_token_id = getattr(model.config, "pad_token_id", None)
     attention_mask = input_ids.ne(pad_token_id) if pad_token_id is not None else None
-    outputs = model(input_ids, attention_mask=attention_mask, use_cache=False)
-    logits = outputs.logits
+    if autocast_dtype is not None and input_ids.device.type == "cuda":
+        forward_context = torch.autocast(device_type="cuda", dtype=autocast_dtype)
+    else:
+        forward_context = nullcontext()
+    with forward_context:
+        outputs = model(input_ids, attention_mask=attention_mask, use_cache=False)
 
-
-    log_probs_all = torch.log_softmax(
-        logits,
-        dim=-1
-    )
-
-    # 提取每一个位置的目标Token ID
+    # log-prob 在 FP32 中计算，gather + logsumexp 不保留完整 log_softmax。
+    # 完整词表 logits 及熵计算的临时 softmax 仍有显存开销。
+    logits = outputs.logits.float()
+    log_z = torch.logsumexp(logits, dim=-1)
     log_probs = torch.gather(
-        log_probs_all,
+        logits,
         dim=-1,
         index=labels.unsqueeze(-1)
-    ).squeeze(-1)
+    ).squeeze(-1) - log_z
 
     result = {
         "log_probs": log_probs,
     }
 
     if return_token_entropy:
-        probs = torch.softmax(logits, dim=-1)
-        token_entropy = -torch.sum(
-            probs * log_probs_all,
-            dim=-1
-        )
+        # 熵仅用于日志：H = −Σ p·log p = logZ − E_p[x]，不持有 autograd 图
+        with torch.no_grad():
+            token_entropy = log_z - (
+                torch.softmax(logits, dim=-1) * logits
+            ).sum(dim=-1)
         result["token_entropy"] = token_entropy
     return result
-
-    # raise NotImplementedError
 
 
 def run_compute_rollout_rewards(
@@ -490,6 +497,7 @@ def run_grpo_train_step(
     cliprange: float | None = None,
     loss_normalization: Literal["sequence", "constant"] = "sequence",
     normalization_constant: int | None = None,
+    autocast_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
     """Execute forward-and-backward passes, with gradient_accumulation_steps
     microbatches.
@@ -542,11 +550,16 @@ def run_grpo_train_step(
             is "grpo" or "gspo".
         loss_normalization: Literal["sequence", "constant"] = "sequence"
             "sequence": average loss over each sequence, then average over
-            sequences; "constant": normalize total loss by a constant (fixed
-            for all of training).
+            sequences; "constant": divide summed loss by one denominator
+            shared across all microbatches in this update.
         normalization_constant: int | None = None
-            The constant to divide total loss by; required if
-            loss_normalization = "constant".
+            The constant to divide total loss by. If loss_normalization =
+            "constant" and this is None, it defaults to the total number of
+            response tokens in the whole rollout batch (token averaging).
+            A caller-supplied constant can instead stay fixed across updates.
+        autocast_dtype: torch.dtype | None
+            If set and training happens on CUDA, forward passes run under
+            torch.autocast with this dtype (FP32 master weights + BF16 compute).
 
     Returns:
         tuple[torch.Tensor, dict[str, torch.Tensor]].
@@ -590,6 +603,10 @@ def run_grpo_train_step(
     response_mask = tokenized["response_mask"].to(device=device)
     if old_log_probs is not None:
         old_log_probs = old_log_probs.detach().to(device=device)
+    # 自动分母实现整个 rollout 批的 token 平均；该数会随批次长度变化，
+    # 并非跨训练固定的 Dr.GRPO 分母。所有 microbatch 必须共用此分母。
+    if loss_normalization == "constant" and normalization_constant is None:
+        normalization_constant = int(response_mask.sum().item())
     # 4. 根据梯度累积步数，将 batch 划分为等大小的 microbatch
     batch_size = input_ids.shape[0]
 
@@ -618,6 +635,7 @@ def run_grpo_train_step(
             input_ids=input_ids[start:end],
             labels=labels[start:end],
             return_token_entropy=True,
+            autocast_dtype=autocast_dtype,
         )
         entropy_sum += (
             result["token_entropy"].detach() * response_mask[start:end]
