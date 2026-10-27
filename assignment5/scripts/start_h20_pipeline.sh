@@ -17,7 +17,8 @@ Stopping the active stage also fails this pipeline and prevents the next stage.
 Overrides: MODEL_PATH, TRAIN_PATH, PIPELINE_ROOT, PIPELINE_NAME, MIN_FREE_GIB,
   SFT_EPOCHS, SFT_MAX_STEPS (unset = full epoch), RL_STEPS, RL_MODE (grpo|grpo-full),
   GENERATION_BACKEND (vllm|transformers), GENERATION_BATCH_SIZE,
-  ADVANTAGE_NORMALIZER, LOSS_NORMALIZATION.
+  ADVANTAGE_NORMALIZER, LOSS_NORMALIZATION, EVAL_EXAMPLES,
+  BEST_CHECKPOINT_ROOT (optional /dev/shm cache; keep only best model per stage).
 No optimizer state is saved; checkpoints support inference and stage handoff.
 EOF
     exit 0
@@ -33,6 +34,7 @@ if [[ "$GENERATION_BACKEND" == vllm ]]; then default_generation_batch=8
 else default_generation_batch=1; fi
 GENERATION_BATCH_SIZE=${GENERATION_BATCH_SIZE:-$default_generation_batch}
 MIN_FREE_GIB=${MIN_FREE_GIB:-45}
+BEST_CHECKPOINT_ROOT=${BEST_CHECKPOINT_ROOT:-}
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 [[ "$PIPELINE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail 'Invalid PIPELINE_NAME'
 [[ "$RL_MODE" == grpo || "$RL_MODE" == grpo-full ]] || fail 'Invalid RL_MODE'
@@ -101,10 +103,16 @@ run_stage() {
 # FP32 parameters and CPU optimizer state; BF16 autocast on the training GPU.
 common=(--device cuda:0 --dtype float32 --autocast bfloat16 --gradient-checkpointing
         --optimizer-name adamw --optimizer-device cpu --no-save-optimizer-state
-        --save-every 2147483647 --eval-examples 64)
+        --save-every 2147483647 --eval-examples "${EVAL_EXAMPLES:-64}")
+best_sft=()
+best_rl=()
+if [[ -n "$BEST_CHECKPOINT_ROOT" ]]; then
+    best_sft=(--best-checkpoint-dir "$BEST_CHECKPOINT_ROOT/$PIPELINE_NAME/sft")
+    best_rl=(--best-checkpoint-dir "$BEST_CHECKPOINT_ROOT/$PIPELINE_NAME/rl")
+fi
 sft_limit=()
 if [[ -n "${SFT_MAX_STEPS:-}" ]]; then sft_limit=(--max-steps "$SFT_MAX_STEPS"); fi
-run_stage sft sft "${common[@]}" --model-id "$MODEL_PATH" --train-path "$TRAIN_PATH" \
+run_stage sft sft "${common[@]}" "${best_sft[@]}" --model-id "$MODEL_PATH" --train-path "$TRAIN_PATH" \
     --num-epochs "${SFT_EPOCHS:-1}" --batch-size 1 --gradient-accumulation-steps 8 \
     --max-seq-length 1024 --learning-rate 1e-5 --eval-every 50 "${sft_limit[@]}"
 shopt -s nullglob
@@ -113,7 +121,7 @@ checkpoints=("$PIPELINE_DIR/stages/sft/artifacts"/checkpoint-*)
 checkpoint=${checkpoints[0]}
 [[ -f "$checkpoint/model.safetensors" || -f "$checkpoint/model.safetensors.index.json" ]] || fail 'SFT checkpoint has no model weights'
 printf '%s\n' "$checkpoint" > "$PIPELINE_DIR/sft_checkpoint"
-run_stage rl "$RL_MODE" "${common[@]}" --model-id "$checkpoint" \
+run_stage rl "$RL_MODE" "${common[@]}" "${best_rl[@]}" --model-id "$checkpoint" \
     --train-path "$PIPELINE_DIR/stages/sft/artifacts/data/train.jsonl" \
     --eval-path "$PIPELINE_DIR/stages/sft/artifacts/data/validation.jsonl" \
     --num-steps "${RL_STEPS:-100}" --prompts-per-batch 2 --group-size 4 \

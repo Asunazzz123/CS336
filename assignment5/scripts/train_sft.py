@@ -34,7 +34,9 @@ from scripts.train_grpo import (
     log_metrics,
     save_checkpoint,
     seed_everything,
+    validate_best_eval_path, validate_best_data, make_best_store, consider_best, finish_best,
 )
+from scripts.profiling import nvtx_range
 
 
 @dataclass
@@ -70,9 +72,11 @@ class SFTConfig:
     # 配合 --dtype float32 实现 FP32 主权重 + BF16 autocast 计算
     autocast: str = "none"
     save_optimizer_state: bool = True
+    best_checkpoint_dir: Path | None = None
 
 
 def _validate_config(config: SFTConfig) -> None:
+    validate_best_eval_path(config.best_checkpoint_dir, config.eval_path)
     for name in (
         "num_epochs", "batch_size", "gradient_accumulation_steps", "max_seq_length",
         "eval_every", "save_every", "eval_examples", "max_new_tokens", "generation_batch_size",
@@ -151,22 +155,25 @@ def _runtime_config(config: SFTConfig, prompt_path: Path) -> TrainConfig:
         reward_type="gsm8k_numeric",
         autocast=config.autocast,
         save_optimizer_state=config.save_optimizer_state,
+        best_checkpoint_dir=config.best_checkpoint_dir,
     )
 
 
 def _loss_sum(model, batch: dict[str, torch.Tensor], autocast: str = "none") -> tuple[torch.Tensor, int]:
     device = next(model.parameters()).device
-    batch = {name: tensor.to(device) for name, tensor in batch.items()}
+    with nvtx_range("sft.batch_to_device", device):
+        batch = {name: tensor.to(device) for name, tensor in batch.items()}
     targets = batch["labels"][:, 1:]
     supervised = targets.ne(-100)
     token_count = int(supervised.sum().item())
     if token_count == 0:
         raise ValueError("An SFT batch has no supervised next-token targets")
-    with autocast_context(model, autocast):
+    with nvtx_range("sft.forward", device), autocast_context(model, autocast):
         logits = model(batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False).logits
     # Select response positions before the FP32 CE, keeping prompt/padding out.
-    selected_logits = logits[:, :-1, :][supervised]
-    loss = F.cross_entropy(selected_logits.float(), targets[supervised], reduction="sum")
+    with nvtx_range("sft.loss", device):
+        selected_logits = logits[:, :-1, :][supervised]
+        loss = F.cross_entropy(selected_logits.float(), targets[supervised], reduction="sum")
     return loss, token_count
 
 
@@ -179,22 +186,31 @@ def train_sft_step(model, optimizer, records, pad_token_id, microbatch_size, max
     if total_tokens == 0:
         raise ValueError("The SFT update has no supervised tokens")
     model.train()
-    optimizer.zero_grad(set_to_none=True)
-    total_loss = torch.zeros((), device=next(model.parameters()).device)
+    device = next(model.parameters()).device
+    with nvtx_range("sft.zero_grad.begin", device):
+        optimizer.zero_grad(set_to_none=True)
+    total_loss = torch.zeros((), device=device)
     for start in range(0, len(records), microbatch_size):
-        batch = collate_sft_batch(records[start:start + microbatch_size], pad_token_id)
-        loss_sum, _ = _loss_sum(model, batch, autocast)
-        if not torch.isfinite(loss_sum):
-            raise ValueError("Non-finite SFT loss")
-        (loss_sum / total_tokens).backward()
-        total_loss += loss_sum.detach() / total_tokens
+        with nvtx_range("sft.microbatch", device):
+            with nvtx_range("sft.collate", device):
+                batch = collate_sft_batch(records[start:start + microbatch_size], pad_token_id)
+            loss_sum, _ = _loss_sum(model, batch, autocast)
+            with nvtx_range("sft.loss_check", device):
+                if not torch.isfinite(loss_sum):
+                    raise ValueError("Non-finite SFT loss")
+            with nvtx_range("sft.backward", device):
+                (loss_sum / total_tokens).backward()
+            total_loss += loss_sum.detach() / total_tokens
     metadata = {"supervised_tokens": total_tokens, "examples": len(records)}
     if max_grad_norm is not None:
-        metadata["grad_norm"] = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), max_grad_norm, error_if_nonfinite=True,
-        ).detach()
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
+        with nvtx_range("sft.clip_grad", device):
+            metadata["grad_norm"] = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_grad_norm, error_if_nonfinite=True,
+            ).detach()
+    with nvtx_range("sft.optimizer_step", device):
+        optimizer.step()
+    with nvtx_range("sft.zero_grad.end", device):
+        optimizer.zero_grad(set_to_none=True)
     return total_loss, metadata
 
 
@@ -223,6 +239,7 @@ def train(config: SFTConfig) -> Path:
     _validate_config(config)
     seed_everything(config.seed)
     train_examples, validation, template, prompt_path = _prepare_examples(config)
+    validate_best_data(config, train_examples, validation, config.eval_path)
     if config.output_dir.exists() and any(config.output_dir.iterdir()):
         raise ValueError("输出目录非空，请选择新的 output-dir")
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -252,6 +269,7 @@ def train(config: SFTConfig) -> Path:
     stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
     if not train_records or not validation_records:
         raise ValueError("No examples remain after length filtering; increase max_seq_length")
+    best = make_best_store(config, "loss", "min")
     context_limit = getattr(runtime.model.config, "max_position_embeddings", None)
     longest = max(len(r["input_ids"]) for r in train_records + validation_records)
     if context_limit and longest > context_limit:
@@ -260,9 +278,12 @@ def train(config: SFTConfig) -> Path:
         runtime.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     def validate(step):
-        metrics = evaluate_sft(runtime.model, validation_records[:config.eval_examples],
-                               runtime.tokenizer.pad_token_id, config.batch_size, config.autocast)
+        with nvtx_range("sft.evaluate", runtime.model.device):
+            metrics = evaluate_sft(runtime.model, validation_records[:config.eval_examples],
+                                   runtime.tokenizer.pad_token_id, config.batch_size, config.autocast)
         log_metrics(config.output_dir, step, "eval", metrics)
+        consider_best(runtime, config, best, step, metrics, eval_path=runtime_config.eval_path,
+                      eval_examples=metrics["num_examples"])
         if config.eval_generation_examples:
             questions = [Question(e.question, e.ground_truth) for e in validation[:config.eval_generation_examples]]
             log_metrics(config.output_dir, step, "eval_generation",
@@ -277,11 +298,12 @@ def train(config: SFTConfig) -> Path:
         for start in range(0, len(indices), update_size):
             selected = [train_records[i] for i in indices[start:start + update_size]]
             started = time.monotonic()
-            loss, metadata = train_sft_step(runtime.model, runtime.optimizer, selected,
-                                            runtime.tokenizer.pad_token_id, config.batch_size,
-                                            config.max_grad_norm, config.autocast)
-            if runtime.model.device.type == "cuda":
-                torch.cuda.synchronize(runtime.model.device)
+            with nvtx_range("sft.update", runtime.model.device):
+                loss, metadata = train_sft_step(runtime.model, runtime.optimizer, selected,
+                                                runtime.tokenizer.pad_token_id, config.batch_size,
+                                                config.max_grad_norm, config.autocast)
+                if runtime.model.device.type == "cuda":
+                    torch.cuda.synchronize(runtime.model.device)
             step += 1
             log_metrics(config.output_dir, step, "train", {
                 **metadata, "loss": loss, "epoch": epoch + 1,
@@ -292,10 +314,13 @@ def train(config: SFTConfig) -> Path:
             )
             if step % config.eval_every == 0 or final_step:
                 validate(step)
-            if step % config.save_every == 0 or final_step:
-                save_checkpoint(runtime, config, step)
+            if best is None and (step % config.save_every == 0 or final_step):
+                with nvtx_range("sft.save_checkpoint", runtime.model.device):
+                    save_checkpoint(runtime, config, step)
                 saved_step = step
             if final_step:
+                if best is not None:
+                    return finish_best(best, config.output_dir)
                 return config.output_dir / f"checkpoint-{saved_step:06d}"
     raise RuntimeError("SFT finished without an optimizer update")
 
@@ -328,8 +353,12 @@ def parse_args() -> SFTConfig:
                         help="建议配合 --dtype float32：FP32 主权重 + BF16 autocast 计算")
     parser.add_argument("--no-save-optimizer-state", dest="save_optimizer_state", action="store_false",
                         help="checkpoint 不保存优化器状态（磁盘紧张时用）")
+    parser.add_argument("--best-checkpoint-dir", type=Path,
+                        help="滚动最佳model-only缓存目录（建议/dev/shm）；结束仅保存checkpoint-best")
     parser.add_argument("--prepare-only", action="store_true")
     config = SFTConfig(**vars(parser.parse_args()))
+    if config.best_checkpoint_dir is not None:
+        config.save_optimizer_state = False
     try:
         if config.optimizer_device == "cpu" and config.optimizer_name == "muon":
             raise ValueError("CPU optimizer offload only supports adam/adamw")

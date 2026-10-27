@@ -36,6 +36,7 @@ def pipeline_env(tmp_path):
 set -eu
 stage=''
 output=''
+best=''
 previous=''
 for argument in "$@"; do
     case "$argument" in
@@ -43,6 +44,7 @@ for argument in "$@"; do
         */train_grpo.py|*/train_grpo_full.py) stage=rl ;;
     esac
     if [[ "$previous" == --output-dir ]]; then output="$argument"; fi
+    if [[ "$previous" == --best-checkpoint-dir ]]; then best="$argument"; fi
     previous="$argument"
 done
 printf '%s\\n' "$@" > "$RECORD_ROOT/$stage.args"
@@ -51,9 +53,11 @@ if [[ "$stage" == sft ]]; then
     if [[ -n "${SFT_RELEASE:-}" ]]; then
         while [[ ! -f "$SFT_RELEASE" ]]; do sleep 0.05; done
     fi
-    mkdir -p "$output/data" "$output/checkpoint-000841"
+    checkpoint=checkpoint-000841
+    if [[ -n "$best" ]]; then checkpoint=checkpoint-best; fi
+    mkdir -p "$output/data" "$output/$checkpoint"
     touch "$output/data/train.jsonl" "$output/data/validation.jsonl"
-    touch "$output/checkpoint-000841/model.safetensors.index.json"
+    touch "$output/$checkpoint/model.safetensors.index.json"
     touch "$RECORD_ROOT/sft.finished"
 else
     [[ -f "$RECORD_ROOT/sft.finished" ]] || exit 99
@@ -117,6 +121,22 @@ def test_sft_failure_prevents_rl(pipeline_env):
     assert result.returncode == 23, result.stdout + result.stderr
     assert not (Path(pipeline_env["RECORD_ROOT"]) / "rl.args").exists()
     assert (pipeline_dir(pipeline_env) / "status").read_text().strip() == "failed"
+
+
+def test_best_policy_uses_separate_ram_caches_and_hands_selected_sft_to_rl(pipeline_env):
+    pipeline_env["BEST_CHECKPOINT_ROOT"] = str(Path(pipeline_env["RECORD_ROOT"]) / "ram cache")
+    pipeline_env["EVAL_EXAMPLES"] = "747"
+    result = subprocess.run(["bash", str(PIPELINE)], env=pipeline_env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    for stage in ("sft", "rl"):
+        arguments = args_for(pipeline_env, stage)
+        assert arguments[arguments.index("--best-checkpoint-dir") + 1] == str(
+            Path(pipeline_env["BEST_CHECKPOINT_ROOT"]) / "test-pipeline" / stage)
+        assert arguments[arguments.index("--eval-examples") + 1] == "747"
+    rl = args_for(pipeline_env, "rl")
+    assert rl[rl.index("--model-id") + 1] == str(
+        pipeline_dir(pipeline_env) / "stages/sft/artifacts/checkpoint-best")
 
 
 def test_whole_pipeline_survives_launching_shell_hangup(pipeline_env):

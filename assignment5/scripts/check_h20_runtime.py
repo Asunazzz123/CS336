@@ -33,6 +33,7 @@ if str(PROJECT_DIR) not in sys.path:
 
 from alignment.grpo import run_get_response_log_probs, run_tokenize_prompt_and_output
 from alignment import vllm_utils
+from utils.device import nvidia_cuda_available
 from scripts.train_grpo import (
     CPUOffloadOptimizer, Question, RolloutBatch, TrainConfig, build_runtime,
     close_runtime, generate_rollouts, json_value, seed_everything, sync_generator,
@@ -297,7 +298,7 @@ def main():
                                      "details": details}), allow_nan=False), flush=True)
 
     try:
-        if not torch.cuda.is_available() or torch.device(args.device).type != "cuda":
+        if not nvidia_cuda_available() or torch.device(args.device).type != "cuda":
             raise RuntimeError("This acceptance check requires a CUDA training device")
         seed_everything(42)
         if args.verify_weight_transfer:

@@ -1,5 +1,8 @@
 # Assignment 5: GSM8K SFT and GRPO Training Results
 
+FSDP2 GRPO is available through `scripts/train_grpo_unified.py --training-backend fsdp2`,
+This path has local CPU/DTensor coverage; the two-GPU CUDA acceptance tests require NVIDIA hardware.
+
 The text backbone of **Qwen/Qwen3.5-4B-Base** was fine-tuned on GSM8K in two completed
 SFT-to-RL experiments: an initial BF16-parameter run and an FP32-parameter/BF16-autocast
 rerun. Each experiment completed **100 SFT updates and 100 RL updates** on one NVIDIA
@@ -81,11 +84,11 @@ do not identify the cause of the outcome or establish that every parameter updat
 
 #### Validation and Training Curves
 
-![Initial SFT training and fixed-sample validation losses](result/asset/SFT/learning_curves.png)
+![Initial SFT training and fixed-sample validation losses](asset/4B/SFT/learning_curves.png)
 
-![Initial RL greedy validation accuracy and response length](result/asset/GRPO/evaluation_curves.png)
+![Initial RL greedy validation accuracy and response length](asset/4B/GRPO/evaluation_curves.png)
 
-![Initial RL training reward, entropy and gradient diagnostics](result/asset/GRPO/training_curves.png)
+![Initial RL training reward, entropy and gradient diagnostics](asset/4B/GRPO/training_curves.png)
 
 ### Runtime and Memory
 
@@ -162,7 +165,7 @@ reduction. Precision, numerical execution and microbatching differ between these
 Training losses below are unsmoothed individual-update measurements. Validation uses
 three fixed-sample measurements; the horizontal axis is optimizer updates.
 
-![Rerun SFT unsmoothed training loss and fixed-64 validation NLL](result/asset/Rerun/sft_learning_curves.png)
+![Rerun SFT unsmoothed training loss and fixed-64 validation NLL](asset/4B/Rerun/sft_learning_curves.png)
 
 | RL update | Correct / 256 | Accuracy | Format rate | Mean response tokens |
 | ---: | ---: | ---: | ---: | ---: |
@@ -181,7 +184,7 @@ BF16 export, and is not a reload test of the saved model.
 
 #### RL Validation Curves
 
-![Rerun fixed-256 greedy accuracy and mean response length](result/asset/Rerun/rl_evaluation_curves.png)
+![Rerun fixed-256 greedy accuracy and mean response length](asset/4B/Rerun/rl_evaluation_curves.png)
 
 ### Training Reward and Update Diagnostics
 
@@ -199,7 +202,7 @@ The five 20-update mean rewards rise from 0.42266 to 0.62578, 0.66484, 0.75078 a
 Individual batches still fluctuate. Entropy falls over most of training and rises again
 near the end. The bold curve below is a trailing mean, not an independent measurement.
 
-![Rerun sampled training reward, token entropy and pre-clip gradient norm](result/asset/Rerun/training.png)
+![Rerun sampled training reward, token entropy and pre-clip gradient norm](asset/4B/Rerun/training.png)
 
 ### Runtime and Memory
 
@@ -241,67 +244,3 @@ and evaluation size changed together. The rerun demonstrates improvement for thi
 recipe on this fixed sample; it does not isolate which change caused it. No independent
 test evaluation or multi-seed replication is available. A checkpoint reload evaluation
 and saving the best validation checkpoint remain useful next checks.
-
-## Environment, Checkpoints, and 9B Preparation
-
-| Environment | Python location | Torch | Transformers | vLLM |
-| --- | --- | --- | --- | --- |
-| Rerun launch scripts | `/root/autodl-tmp/envs/agent/bin/python` | 2.10.0+cu128 | 5.2.0 | Not installed |
-| Default `conda run -n agent` | `/root/miniconda3/envs/agent/bin/python` | 2.10.0+cu129 | 5.5.4 | 0.19.1 |
-
-These are separate environments. The rerun checkpoint configuration also records
-Transformers 5.2.0. Both have FLA core 0.5.2, causal-conv1d 1.7.0 and TileLang 0.1.15.
-The actual launch scripts are archived with the evidence, rather than inferred from
-the current default Conda selection. Successful historical tests in one environment
-do not validate the other environment's 9B route.
-
-Each saved 4B BF16 model is **8,411,558,400 bytes, 7.83GiB**. The rerun SFT optimizer/RNG
-file is **33,646,404,331 bytes, 31.34GiB**; RL's small step/RNG file is only 15,008 bytes.
-RL did not retain AdamW moments. The trainers currently have no complete resume entry point.
-
-The 9B Base download is complete: revision `68c46c4b3498877f3ef123c856ecfde50c39f404`,
-14 files totaling 19,329,309,406 bytes, all rechecked by SHA-256. The text export is
-complete. A short real dual-H20 check passed generation, NCCL weight transfer, one
-CPU-offloaded AdamW update and post-update generation. Its raw JSON/log were recovered
-from the cloned disk on 2026-10-25 into `result/deployment/runtime-697/`.
-No formal 9B SFT/RL experiment is complete.
-The route keeps **FP32 live parameters and gradients on GPU 0**, with a CPU FP32
-master copy, CPU gradients and AdamW moments. GPU 1 runs vLLM. Rollout and update
-execute sequentially. See the [dual-GPU code review](docs/dual_gpu_feasibility.md)
-for evidence, resource assumptions and remaining validation limits.
-
-The [9B SSD capacity and cleanup plan](docs/ssd_plan_9b.md) records the current filesystems,
-exact cleanup candidates, retention costs and the model-only checkpoint budget.
-The [9B workflow](docs/qwen35_9b_h20.md) describes the proposed route; it is not a completed experiment.
-The [711 storage plan](docs/711_storage_plan.md) records the authorized 4B cleanup and
-a 50GiB SSD route using RAM-backed Base storage; 711 has not yet passed runtime validation.
-
-## Raw Results and Reproduction
-
-| Artifact | Location |
-| --- | --- |
-| Initial experiment summary and source hashes | [summary.json](result/summary.json), [historical source snapshot](result/raw/source_at_run/README.md) |
-| Initial raw SFT / RL data | [SFT](result/raw/sft/), [RL](result/raw/rl/) |
-| Rerun SFT / RL exports | [SFT](result/raw/sft_fp32ac/), [RL](result/raw/rl_drgrpo/) |
-| Rerun verified summary | [rerun_summary.json](result/rerun_summary.json) |
-| Rerun raw server inventory / model validation | [inventory](result/raw/zcode_audit_20261024/server_inventory.json), [validation](result/raw/zcode_audit_20261024/validation.json) |
-| Environment inspection | [environments.json](result/raw/zcode_audit_20261024/environments.json) |
-| Archived launch scripts | [SFT](result/raw/zcode_audit_20261024/remote/setup/launch_sft.sh), [RL](result/raw/zcode_audit_20261024/remote/setup/launch_rl.sh) |
-| Rerun evaluation tables | [SFT CSV](result/tables/rerun_sft_evaluation.csv), [RL CSV](result/tables/rerun_rl_evaluation.csv) |
-| Rerun per-update tables | [SFT CSV](result/tables/rerun_sft_training.csv), [RL CSV](result/tables/rerun_rl_training.csv) |
-| Detailed Chinese audit and interpretation | [zcode_results_audit.md](docs/zcode_results_audit.md) |
-| Training implementation | [training_workflow.md](docs/training_workflow.md) |
-
-From `assignment5`, regenerate both reports and figures in the local `agent` environment
-with Matplotlib installed:
-
-```bash
-conda run -n agent python result/summarize_results.py
-conda run -n agent python result/summarize_rerun.py
-```
-
-The rerun analysis verifies 35 exported evidence files by byte size and SHA-256 and confirms
-that the dataset split matches the first experiment. Source hashes were collected after
-the jobs; no training-time Git commit was supplied. Raw metrics remain unchanged.
-Result files live under `result/`, which is currently ignored by the project Git rules;
-these local/server artifacts are not automatically included in a future Git commit.

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+from utils.device import get_device_id
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +321,7 @@ def generate_completions(
 
 
 def init_weight_sync(vllm_base_url: str, policy_device: str):
+    device_id = get_device_id(policy_device)
     from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
     from vllm.utils.network_utils import get_ip, get_open_port
 
@@ -334,7 +336,7 @@ def init_weight_sync(vllm_base_url: str, policy_device: str):
         "world_size": world_size,
     }
 
-    torch.cuda.set_device(torch.device(policy_device))
+    torch.cuda.set_device(device_id)
     with ThreadPoolExecutor(max_workers=1) as executor:
         init_future = executor.submit(
             _http_json,
@@ -356,6 +358,7 @@ def init_weight_sync(vllm_base_url: str, policy_device: str):
 
 
 def sync_policy_weights(policy: torch.nn.Module, vllm_base_url: str, weight_sync_group) -> None:
+    device_id = get_device_id(next(policy.parameters()).device)
     """Copy policy weights into vLLM and invalidate caches derived from old weights."""
     from vllm.distributed.weight_transfer.nccl_engine import (
         NCCLTrainerSendWeightsArgs,
@@ -385,7 +388,7 @@ def sync_policy_weights(policy: torch.nn.Module, vllm_base_url: str, weight_sync
         for (name, tensor), dtype in zip(weights, transfer_dtypes)
     )
 
-    torch.cuda.set_device(next(policy.parameters()).device)
+    torch.cuda.set_device(device_id)
     _http_json("POST", f"{vllm_base_url}/pause", timeout=60)
     sync_error = None
     try:

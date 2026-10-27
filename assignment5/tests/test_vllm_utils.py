@@ -16,7 +16,17 @@ def install_transfer_stub(monkeypatch, send):
     module.NCCLTrainerSendWeightsArgs = SimpleNamespace
     module.NCCLWeightTransferEngine = SimpleNamespace(trainer_send_weights=send)
     monkeypatch.setitem(sys.modules, path, module)
+    # CPU tensors stand in for policy weights; fake the CUDA boundary explicitly.
+    monkeypatch.setattr(vllm_utils, "get_device_id", lambda device: 0)
     monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+
+
+def test_weight_sync_rejects_cpu_before_importing_backend_or_calling_http(monkeypatch):
+    monkeypatch.setattr(vllm_utils, "_http_json", lambda *a, **k: pytest.fail("Unexpected HTTP"))
+    with pytest.raises(ValueError, match="CUDA device"):
+        vllm_utils.init_weight_sync("http://unused", "cpu")
+    with pytest.raises(ValueError, match="CUDA device"):
+        vllm_utils.sync_policy_weights(torch.nn.Linear(2, 2), "http://unused", "unused")
 
 
 def test_server_limits_qwen_recurrent_cache_and_eager_execution(monkeypatch):
