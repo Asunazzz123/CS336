@@ -3,6 +3,7 @@ from dataclasses import asdict
 import json
 import logging
 import math
+import os
 
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -26,8 +27,15 @@ def validate_fsdp_config(config, world_size=None):
     for name in ("temperature", "cliprange"):
         if hasattr(config, name) and (not math.isfinite(getattr(config, name)) or getattr(config, name) <= 0):
             raise ValueError(f"{name} must be finite and positive")
-    if config.generation_backend != "transformers":
-        raise ValueError("fsdp2 currently uses collective engine rollout; vLLM is unsupported")
+    if config.generation_backend not in ("transformers", "vllm"):
+        raise ValueError("Unknown generation backend")
+    if config.generation_backend == "vllm":
+        utilization = getattr(config, "vllm_memory_utilization", 0.8)
+        if not math.isfinite(utilization) or not 0 < utilization < 1:
+            raise ValueError("vllm_memory_utilization must be between 0 and 1")
+        for name in ("vllm_startup_timeout", "vllm_max_model_len"):
+            if getattr(config, name, 1) <= 0:
+                raise ValueError(f"{name} must be positive")
     if config.optimizer_name != "adamw" or config.optimizer_device != "model":
         raise ValueError("fsdp2 requires GPU-sharded AdamW (--optimizer-name adamw --optimizer-device model)")
     if config.dtype not in ("float32", "bfloat16"):
@@ -63,6 +71,16 @@ def generate(engine, tokenizer, prompts, config, *, temperature):
             tokenizer.padding_side = previous
     inputs = local_call(ctx, tokenize)
     ids, mask = (inputs[key].to(ctx.device) for key in ("input_ids", "attention_mask"))
+    if getattr(engine, "external_generation", None) is not None:
+        raw_ids = [row[active.bool()].tolist() for row, active in zip(ids, mask)]
+        if not ctx.all_true(all(len(row) + config.max_new_tokens <= config.vllm_max_model_len for row in raw_ids)):
+            raise ValueError("Prompt plus generation exceeds vLLM context limit")
+        rollout = engine.external_generation.generate(raw_ids, temperature=temperature,
+            max_new_tokens=config.max_new_tokens,
+            seed=config.seed + 104729 * engine.rollout_id + 1009 * engine.policy_version)
+        responses = local_call(ctx, lambda: [tokenizer.decode(row[active].tolist(), skip_special_tokens=True)
+                                            for row, active in zip(rollout.response_ids, rollout.response_mask)])
+        return ids, mask, rollout, responses
     ctx.agree("generation batches", math.ceil(len(prompts) / config.generation_batch_size))
     results = []
     for start in range(0, len(prompts), config.generation_batch_size):
@@ -111,9 +129,16 @@ def evaluate(engine, tokenizer, questions, template, config, reward_fn):
 def train_fsdp(config):
     validate_fsdp_config(config)
     validate_best_eval_path(config.best_checkpoint_dir, config.eval_path)
-    with NvidiaContext.from_torchrun() as ctx:
+    context = (NvidiaContext.from_torchrun(timeout_seconds=config.vllm_startup_timeout + 4500)
+               if config.generation_backend == "vllm" else NvidiaContext.from_torchrun())
+    with context as ctx:
         ctx.agree("GRPO config", json_value(asdict(config)))
         validate_fsdp_config(config, ctx.world_size)
+        if config.generation_backend == "vllm":
+            if int(os.environ.get("LOCAL_WORLD_SIZE", ctx.world_size)) != ctx.world_size:
+                raise ValueError("Colocated vLLM generation currently requires a single-node torchrun job")
+            if not 0 <= config.vllm_gpu < ctx.world_size or config.vllm_gpu == 0:
+                raise ValueError("Use a nonzero local GPU for vLLM; rank 0 is the NCCL sender")
         def prepare():
             train_questions = load_questions(config.train_path)
             validation = load_questions(config.eval_path)
@@ -156,6 +181,15 @@ def train_fsdp(config):
             weight_decay=config.weight_decay, max_grad_norm=config.max_grad_norm,
             gradient_checkpointing=config.gradient_checkpointing, seed=config.seed))
         try:
+            if config.generation_backend == "vllm":
+                from distributed.generation import ExternalGeneration
+                from generation.vllm import VLLMBackend
+                engine.external_generation = ExternalGeneration(engine, tokenizer,
+                    lambda: VLLMBackend(host=config.vllm_host, port=config.vllm_port, gpu=config.vllm_gpu,
+                        policy_device=str(ctx.device), gpu_memory_utilization=config.vllm_memory_utilization,
+                        max_model_len=config.vllm_max_model_len, max_num_seqs=config.generation_batch_size,
+                        startup_timeout=config.vllm_startup_timeout),
+                    config.rollout_checkpoint_dir, source_model=config.model_id)
             trainer = FSDPGRPOTrainer(engine, num_epochs_per_rollout=config.num_epochs_per_rollout,
                 gradient_accumulation_steps=config.gradient_accumulation_steps,
                 importance_reweighting_method=config.importance_reweighting_method,
@@ -194,10 +228,18 @@ def train_fsdp(config):
                 if step % config.eval_every == 0 or step == config.num_steps:
                     validation_step(step)
                 if best is None and (step % config.save_every == 0 or step == config.num_steps):
-                    # DCP remains the collective training-state format. Multi-node
-                    # jobs need shared storage here, unlike the rank-0 best cache.
-                    engine.save_checkpoint(config.output_dir / f"checkpoint-{step:06d}",
-                        include_optimizer=config.save_optimizer_state, metadata={"step": step})
+                    destination = config.output_dir / f"checkpoint-{step:06d}"
+                    if config.checkpoint_format == "hf":
+                        engine.export_model_only_hf(destination, tokenizer=tokenizer)
+                        ctx.root_call(lambda: (destination / "config.json.run").write_text(
+                            json.dumps({"model_id": config.model_id}) + "\n"))
+                        if config.save_optimizer_state:
+                            engine.save_checkpoint(config.output_dir / f"resume-{step:06d}",
+                                include_optimizer=True, metadata={"step": step})
+                    else:
+                        # DCP paths require storage shared by all ranks.
+                        engine.save_checkpoint(destination, include_optimizer=config.save_optimizer_state,
+                                               metadata={"step": step})
             if best is not None:
                 destination = best.export(config.output_dir / "checkpoint-best")
                 selection = best.selection()
@@ -208,4 +250,8 @@ def train_fsdp(config):
                 except (RuntimeError, OSError):
                     logging.getLogger(__name__).warning("Best exported; RAM cleanup failed", exc_info=True)
         finally:
-            engine.close()
+            try:
+                if getattr(engine, "external_generation", None) is not None:
+                    engine.external_generation.close()
+            finally:
+                engine.close()

@@ -31,6 +31,8 @@ Environment:
   CONDA_ENV  Conda environment name (default: agent)
   RUN_ROOT   Job control/log directory (default: assignment5/outputs/jobs)
   RUN_NAME   Unique job directory name (default: mode + timestamp + launcher PID)
+  TRAINING_BACKEND  transformers (default) or fsdp2; also accepts --training-backend
+  NPROC_PER_NODE    FSDP ranks on this host (default: 2)
 
 Each job contains train.log, command.sh, pid, pid_start, status and exit_code.
 Trainer --output-dir defaults to JOB_DIR/artifacts, separate from control files.
@@ -70,9 +72,15 @@ add_default() {
 }
 
 make_command() {
-    local job="$1" mode="$2" entry
+    local job="$1" mode="$2" entry backend="${TRAINING_BACKEND:-transformers}" previous='' argument
     shift 2
     TRAIN_ARGS=("$@")
+    for argument in "${TRAIN_ARGS[@]}"; do
+        if [[ "$previous" == --training-backend ]]; then backend="$argument"; fi
+        case "$argument" in --training-backend=*) backend="${argument#*=}" ;; esac
+        previous="$argument"
+    done
+    [[ "$backend" == transformers || "$backend" == fsdp2 ]] || fail "Unknown training backend: $backend"
     case "$mode" in
         sft) entry=train_sft.py ;;
         grpo) entry=train_grpo.py ;;
@@ -80,7 +88,22 @@ make_command() {
         *) fail "Unknown training mode: $mode" ;;
     esac
     resolve_conda
-    COMMAND=("$CONDA_BIN" run --no-capture-output -n "$CONDA_ENV" python -u "$SCRIPT_DIR/$entry")
+    if [[ "$backend" == fsdp2 ]]; then
+        [[ "${NPROC_PER_NODE:-2}" =~ ^[0-9]+$ && "${NPROC_PER_NODE:-2}" -ge 2 ]] || fail 'FSDP needs NPROC_PER_NODE >=2'
+        if [[ "$mode" != sft ]]; then entry=train_grpo_unified.py; fi
+        COMMAND=("$CONDA_BIN" run --no-capture-output -n "$CONDA_ENV" python -u -m torch.distributed.run
+                 --standalone "--nproc-per-node=${NPROC_PER_NODE:-2}" "$SCRIPT_DIR/$entry")
+        add_default --training-backend fsdp2
+        if [[ "$mode" == grpo ]]; then
+            add_default --num-epochs-per-rollout 1
+            add_default --advantage-normalizer none
+            add_default --loss-normalization constant
+        elif [[ "$mode" == grpo-full ]]; then
+            add_default --num-epochs-per-rollout 3
+        fi
+    else
+        COMMAND=("$CONDA_BIN" run --no-capture-output -n "$CONDA_ENV" python -u "$SCRIPT_DIR/$entry")
+    fi
     add_default --model-id Qwen/Qwen3.5-4B-Base
     add_default --device cuda:0
     add_default --dtype bfloat16

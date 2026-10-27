@@ -121,6 +121,11 @@ class UnifiedGRPOConfig:
     save_optimizer_state: bool = True
     best_checkpoint_dir: Path | None = None
     training_backend: str = "transformers"
+    rollout_checkpoint_dir: Path = Path("/dev/shm/cs336-rollout")
+    vllm_memory_utilization: float = 0.8
+    vllm_max_model_len: int = 2048
+    vllm_startup_timeout: int = 600
+    checkpoint_format: str = "dcp"
 
 
 def _compute_old_log_probs(
@@ -255,7 +260,7 @@ def train(config: UnifiedGRPOConfig) -> None:
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
     # 保存运行配置
-    run_cfg = asdict(config)
+    run_cfg = json_value(asdict(config))
     run_cfg["train_path"] = str(config.train_path)
     run_cfg["eval_path"] = str(config.eval_path)
     run_cfg["prompt_path"] = str(config.prompt_path)
@@ -461,6 +466,10 @@ def parse_args() -> UnifiedGRPOConfig:
     parser.add_argument("--vllm-host", default="127.0.0.1")
     parser.add_argument("--vllm-port", type=int, default=8000)
     parser.add_argument("--vllm-gpu", type=int, default=1)
+    parser.add_argument("--rollout-checkpoint-dir", type=Path, default=Path("/dev/shm/cs336-rollout"))
+    parser.add_argument("--vllm-memory-utilization", type=float, default=0.8)
+    parser.add_argument("--vllm-max-model-len", type=int, default=2048)
+    parser.add_argument("--vllm-startup-timeout", type=int, default=600)
 
     # === 训练超参数 ===
     parser.add_argument("--seed", type=int, default=42)
@@ -504,6 +513,8 @@ def parse_args() -> UnifiedGRPOConfig:
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--eval-examples", type=int, default=128)
     parser.add_argument("--save-every", type=int, default=20)
+    parser.add_argument("--checkpoint-format", choices=["dcp", "hf"], default="dcp",
+                       help="FSDP periodic output format; best checkpoints always use HF")
     parser.add_argument("--no-save-optimizer-state", dest="save_optimizer_state",
                        action="store_false",
                        help="checkpoint 不保存优化器状态")

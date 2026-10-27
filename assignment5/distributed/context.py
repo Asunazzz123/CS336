@@ -62,6 +62,11 @@ class NvidiaContext:
         if any(other != values[0] for other in values):
             raise RuntimeError(f"Ranks disagree on {name}: {values}")
 
+    def gather_objects(self, value):
+        values = [None] * self.world_size
+        dist.all_gather_object(values, value)
+        return values
+
     def root_call(self, fn: Callable[[], T]) -> T:
         """Propagate rank-0 I/O/sink errors before the next collective."""
         result = [None]

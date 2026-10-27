@@ -1,7 +1,9 @@
 # Assignment 5: GSM8K SFT and GRPO Training Results
 
-FSDP2 GRPO is available through `scripts/train_grpo_unified.py --training-backend fsdp2`,
-This path has local CPU/DTensor coverage; the two-GPU CUDA acceptance tests require NVIDIA hardware.
+FSDP2 SFT and GRPO are available through `--training-backend fsdp2`.
+The 9B pipeline now launches two ranks and uses a separate vLLM module for generation;
+training and inference share the GPUs in separate phases. 
+Local CPU/DTensor and launcher tests pass; real two-GPU/vLLM acceptance requires NVIDIA hardware and vLLM.
 
 The text backbone of **Qwen/Qwen3.5-4B-Base** was fine-tuned on GSM8K in two completed
 SFT-to-RL experiments: an initial BF16-parameter run and an FP32-parameter/BF16-autocast

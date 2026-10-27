@@ -41,7 +41,7 @@ previous=''
 for argument in "$@"; do
     case "$argument" in
         */train_sft.py) stage=sft ;;
-        */train_grpo.py|*/train_grpo_full.py) stage=rl ;;
+        */train_grpo.py|*/train_grpo_full.py|*/train_grpo_unified.py) stage=rl ;;
     esac
     if [[ "$previous" == --output-dir ]]; then output="$argument"; fi
     if [[ "$previous" == --best-checkpoint-dir ]]; then best="$argument"; fi
@@ -104,13 +104,17 @@ def test_sft_then_rl_handoff_and_full_epoch_defaults(pipeline_env):
     assert rl[rl.index("--model-id") + 1] == str(checkpoint)
     assert rl[rl.index("--train-path") + 1] == str(checkpoint.parent / "data/train.jsonl")
     for args in (sft, rl):
-        assert args[args.index("--optimizer-device") + 1] == "cpu"
+        assert args[args.index("--optimizer-device") + 1] == "model"
+        assert args[args.index("--training-backend") + 1] == "fsdp2"
+        assert "torch.distributed.run" in args and "--nproc-per-node=2" in args
+        assert args[args.index("--gradient-accumulation-steps") + 1] == "4"
         assert args[args.index("--dtype") + 1] == "float32"
         assert args[args.index("--autocast") + 1] == "bfloat16"
         assert args[args.index("--save-every") + 1] == "2147483647"
         assert "--no-save-optimizer-state" in args
         assert "--gradient-checkpointing" in args
-    assert any(arg.endswith("/train_grpo.py") for arg in rl)
+    assert any(arg.endswith("/train_grpo_unified.py") for arg in rl)
+    assert rl[rl.index("--checkpoint-format") + 1] == "hf"
     assert (pipeline_dir(pipeline_env) / "status").read_text().strip() == "succeeded"
 
 

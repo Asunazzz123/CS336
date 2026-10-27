@@ -8,7 +8,8 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     cat <<'EOF'
 Usage: bash scripts/start_h20_pipeline.sh
 Runs one GSM8K SFT epoch, then 100 RL updates; waits for SFT success first.
-Default: Qwen3.5-9B-Base-text, GPU0 training, GPU1 vLLM, CPU AdamW state.
+Default: Qwen3.5-9B-Base-text, two-rank FSDP2 SFT/GRPO, GPU-sharded AdamW.
+vLLM uses GPU1 during generation; FSDP shards park on CPU for that phase.
 Use nohup for the entire pipeline (not just SFT):
   mkdir -p outputs/pipelines
   nohup bash scripts/start_h20_pipeline.sh >outputs/pipelines/launch.log 2>&1 </dev/null &
@@ -19,6 +20,9 @@ Overrides: MODEL_PATH, TRAIN_PATH, PIPELINE_ROOT, PIPELINE_NAME, MIN_FREE_GIB,
   GENERATION_BACKEND (vllm|transformers), GENERATION_BATCH_SIZE,
   ADVANTAGE_NORMALIZER, LOSS_NORMALIZATION, EVAL_EXAMPLES,
   BEST_CHECKPOINT_ROOT (optional /dev/shm cache; keep only best model per stage).
+  TRAINING_BACKEND (fsdp2 default; transformers for legacy single-GPU runs),
+  NPROC_PER_NODE (2), SFT_ACCUMULATION_STEPS, RL_ACCUMULATION_STEPS,
+  ROLLOUT_CHECKPOINT_ROOT (default /dev/shm/cs336-rollout), VLLM_BASE_MODEL_PATH.
 No optimizer state is saved; checkpoints support inference and stage handoff.
 EOF
     exit 0
@@ -35,10 +39,23 @@ else default_generation_batch=1; fi
 GENERATION_BATCH_SIZE=${GENERATION_BATCH_SIZE:-$default_generation_batch}
 MIN_FREE_GIB=${MIN_FREE_GIB:-45}
 BEST_CHECKPOINT_ROOT=${BEST_CHECKPOINT_ROOT:-}
+TRAINING_BACKEND=${TRAINING_BACKEND:-fsdp2}
+export TRAINING_BACKEND
+NPROC_PER_NODE=${NPROC_PER_NODE:-2}
+export NPROC_PER_NODE
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 [[ "$PIPELINE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail 'Invalid PIPELINE_NAME'
 [[ "$RL_MODE" == grpo || "$RL_MODE" == grpo-full ]] || fail 'Invalid RL_MODE'
 [[ "$GENERATION_BACKEND" == vllm || "$GENERATION_BACKEND" == transformers ]] || fail 'Invalid GENERATION_BACKEND'
+[[ "$TRAINING_BACKEND" == fsdp2 || "$TRAINING_BACKEND" == transformers ]] || fail 'Invalid TRAINING_BACKEND'
+if [[ "$TRAINING_BACKEND" == fsdp2 ]]; then
+    [[ "$NPROC_PER_NODE" == 2 ]] || fail 'This 9B pipeline requires exactly two FSDP ranks'
+    default_accumulation=4
+    optimizer_device=model
+else
+    default_accumulation=8
+    optimizer_device=cpu
+fi
 [[ "$MIN_FREE_GIB" =~ ^[0-9]+$ ]] || fail 'MIN_FREE_GIB must be a nonnegative integer'
 [[ -f "$TRAIN_PATH" ]] || fail "Training data missing: $TRAIN_PATH"
 [[ -f "$MODEL_PATH/config.json" ]] || fail "Model config missing: $MODEL_PATH"
@@ -100,9 +117,8 @@ run_stage() {
     stage_pid=''
     return "$code"
 }
-# FP32 parameters and CPU optimizer state; BF16 autocast on the training GPU.
-common=(--device cuda:0 --dtype float32 --autocast bfloat16 --gradient-checkpointing
-        --optimizer-name adamw --optimizer-device cpu --no-save-optimizer-state
+common=(--training-backend "$TRAINING_BACKEND" --device cuda:0 --dtype float32 --autocast bfloat16 --gradient-checkpointing
+        --optimizer-name adamw --optimizer-device "$optimizer_device" --no-save-optimizer-state
         --save-every 2147483647 --eval-examples "${EVAL_EXAMPLES:-64}")
 best_sft=()
 best_rl=()
@@ -113,7 +129,7 @@ fi
 sft_limit=()
 if [[ -n "${SFT_MAX_STEPS:-}" ]]; then sft_limit=(--max-steps "$SFT_MAX_STEPS"); fi
 run_stage sft sft "${common[@]}" "${best_sft[@]}" --model-id "$MODEL_PATH" --train-path "$TRAIN_PATH" \
-    --num-epochs "${SFT_EPOCHS:-1}" --batch-size 1 --gradient-accumulation-steps 8 \
+    --num-epochs "${SFT_EPOCHS:-1}" --batch-size 1 --gradient-accumulation-steps "${SFT_ACCUMULATION_STEPS:-$default_accumulation}" \
     --max-seq-length 1024 --learning-rate 1e-5 --eval-every 50 "${sft_limit[@]}"
 shopt -s nullglob
 checkpoints=("$PIPELINE_DIR/stages/sft/artifacts"/checkpoint-*)
@@ -125,7 +141,9 @@ run_stage rl "$RL_MODE" "${common[@]}" "${best_rl[@]}" --model-id "$checkpoint" 
     --train-path "$PIPELINE_DIR/stages/sft/artifacts/data/train.jsonl" \
     --eval-path "$PIPELINE_DIR/stages/sft/artifacts/data/validation.jsonl" \
     --num-steps "${RL_STEPS:-100}" --prompts-per-batch 2 --group-size 4 \
-    --gradient-accumulation-steps 8 --max-new-tokens 512 --learning-rate 1e-6 \
+    --gradient-accumulation-steps "${RL_ACCUMULATION_STEPS:-$default_accumulation}" --max-new-tokens 512 --learning-rate 1e-6 \
     --eval-every 20 --generation-batch-size "$GENERATION_BATCH_SIZE" --generation-backend "$GENERATION_BACKEND" \
     --vllm-gpu 1 --advantage-normalizer "${ADVANTAGE_NORMALIZER:-none}" \
-    --loss-normalization "${LOSS_NORMALIZATION:-constant}"
+    --loss-normalization "${LOSS_NORMALIZATION:-constant}" \
+    --checkpoint-format hf \
+    --rollout-checkpoint-dir "${ROLLOUT_CHECKPOINT_ROOT:-/dev/shm/cs336-rollout}/$PIPELINE_NAME"

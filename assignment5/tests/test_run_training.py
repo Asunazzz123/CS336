@@ -133,6 +133,16 @@ def test_training_failure_is_saved_and_foreground_returns_same_code(launcher_env
     assert "23" in status.stdout + status.stderr
 
 
+@pytest.mark.parametrize("mode", ["sft", "grpo", "grpo-full"])
+def test_fsdp_launcher_starts_two_ranks_without_wrapper_subprocess(launcher_env, mode):
+    result = _launch(launcher_env, "run", mode, "--training-backend=fsdp2")
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = Path(launcher_env["FAKE_RECORD"]).read_text().splitlines()
+    assert "torch.distributed.run" in args and "--nproc-per-node=2" in args
+    entry = "train_sft.py" if mode == "sft" else "train_grpo_unified.py"
+    assert any(arg.endswith("/" + entry) for arg in args)
+
+
 def test_background_failure_remains_observable_after_start_returns(launcher_env):
     launcher_env["FAKE_EXIT"] = "19"
     result = _launch(launcher_env, "start", "grpo")

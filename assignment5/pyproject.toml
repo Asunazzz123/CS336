@@ -20,7 +20,7 @@ gpu = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["alignment*", "distributed*", "utils*"]
+include = ["alignment*", "distributed*", "utils*", "generation*"]
 
 [tool.uv]
 package = true

@@ -24,7 +24,7 @@ from alignment.sft import (
     load_gsm8k_examples,
     split_examples,
 )
-from scripts.train_grpo import (
+from scripts.train_grpo_base import (
     Question,
     TrainConfig,
     autocast_context,
@@ -73,6 +73,7 @@ class SFTConfig:
     autocast: str = "none"
     save_optimizer_state: bool = True
     best_checkpoint_dir: Path | None = None
+    training_backend: str = "transformers"
 
 
 def _validate_config(config: SFTConfig) -> None:
@@ -237,6 +238,11 @@ def evaluate_sft(model, records, pad_token_id, batch_size, autocast: str = "none
 
 def train(config: SFTConfig) -> Path:
     _validate_config(config)
+    if config.training_backend == "fsdp2":
+        from scripts.fsdp_sft_runtime import train_fsdp_sft
+        return train_fsdp_sft(config)
+    if config.training_backend != "transformers":
+        raise ValueError("Unknown training backend")
     seed_everything(config.seed)
     train_examples, validation, template, prompt_path = _prepare_examples(config)
     validate_best_data(config, train_examples, validation, config.eval_path)
@@ -333,6 +339,7 @@ def parse_args() -> SFTConfig:
     parser.add_argument("--eval-path", type=Path)
     parser.add_argument("--prompt-path", type=Path)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--training-backend", choices=["transformers", "fsdp2"], default="transformers")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
     parser.add_argument("--optimizer-name", choices=["adam", "adamw", "muon"], default="adamw")
     parser.add_argument("--optimizer-device", choices=["model", "cpu"], default="model",

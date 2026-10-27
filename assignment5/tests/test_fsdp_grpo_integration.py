@@ -153,7 +153,7 @@ def test_fsdp_constraints_and_whole_group_partition():
         optimizer_device="model", dtype="bfloat16", prompts_per_batch=4, group_size=2,
         gradient_accumulation_steps=2)
     validate_fsdp_config(config, 2)
-    for field, value in (("generation_backend", "vllm"), ("optimizer_device", "cpu"),
+    for field, value in (("generation_backend", "unknown"), ("optimizer_device", "cpu"),
                          ("dtype", "float16"), ("prompts_per_batch", 3),
                          ("gradient_accumulation_steps", 3)):
         with pytest.raises(ValueError):
@@ -176,8 +176,9 @@ def test_evaluation_excludes_duplicate_padding_on_short_rank(monkeypatch):
     assert metrics["accuracy"] == 1 and metrics["eval_examples"] == 1
 
 
-@pytest.mark.parametrize("backend", ["transformers", "fsdp2"])
-def test_unified_entry_runs_local_tiny_training_and_best_export(tmp_path, monkeypatch, backend):
+@pytest.mark.parametrize("backend,generation", [("transformers", "transformers"),
+    ("fsdp2", "transformers"), ("fsdp2", "vllm")])
+def test_unified_entry_runs_local_tiny_training_and_best_export(tmp_path, monkeypatch, backend, generation):
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
     from tokenizers.pre_tokenizers import Whitespace
@@ -195,30 +196,58 @@ def test_unified_entry_runs_local_tiny_training_and_best_export(tmp_path, monkey
                                         eos_token="<eos>", unk_token="<unk>")
     tokenizer.save_pretrained(model_path)
     training, validation, prompt = (tmp_path / p for p in ("train.jsonl", "val.jsonl", "prompt.txt"))
-    training.write_text(json.dumps({"question": "q", "answer": "x #### 1"}) + "\n")
+    training.write_text("\n".join(json.dumps({"question": q, "answer": "x #### 1"})
+                                  for q in ("q", "q q")) + "\n")
     validation.write_text(json.dumps({"question": "v", "answer": "x #### 2"}) + "\n")
     prompt.write_text("{question}")
     config = UnifiedGRPOConfig(str(model_path), training, validation, prompt, tmp_path / "out",
         dtype="float32", num_steps=1, prompts_per_batch=1, group_size=2,
         gradient_accumulation_steps=2, max_new_tokens=2, eval_examples=1, eval_every=1,
-        num_epochs_per_rollout=2, best_checkpoint_dir=tmp_path / "cache", training_backend=backend)
+        num_epochs_per_rollout=2, best_checkpoint_dir=tmp_path / "cache", training_backend=backend,
+        generation_backend=generation, rollout_checkpoint_dir=tmp_path / "rollouts")
+    external_versions = []
     if backend == "fsdp2":
         class Context(LocalCollectives):
+            world_size = 2 if generation == "vllm" else 1
+            def gather_objects(self, value):
+                return [value] * self.world_size
             def __enter__(self):
                 return self
             def __exit__(self, *args):
                 pass
-        monkeypatch.setattr(runtime.NvidiaContext, "from_torchrun", lambda: Context())
+        monkeypatch.setattr(runtime.NvidiaContext, "from_torchrun", lambda **kwargs: Context())
         def build(ctx, factory, fsdp_config):
             engine = local_engine(factory())
             engine.context, engine.config = ctx, fsdp_config
+            if generation == "vllm":
+                from distributed import Phase
+                engine.park = lambda: setattr(engine, "phase", Phase.PARKED)
+                engine.resume = lambda: setattr(engine, "phase", Phase.READY)
             return engine
         monkeypatch.setattr(runtime, "NvidiaFSDPEngine", build)
+    if generation == "vllm":
+        from generation import vllm
+        config.prompts_per_batch = 2
+        class Backend:
+            def __init__(self, **kwargs):
+                pass
+            def load_policy(self, snapshot):
+                validate_hf_checkpoint(snapshot.path)
+                external_versions.append(snapshot.version)
+                return snapshot.version
+            def generate(self, prompts, params):
+                return [vllm.VLLMCompletion("q", [3, 1], "stop") for _ in prompts]
+            def close(self):
+                pass
+        monkeypatch.setattr(vllm, "VLLMBackend", Backend)
     train(config)
     assert not config.best_checkpoint_dir.exists()
     validate_hf_checkpoint(config.output_dir / "checkpoint-best")
     records = [json.loads(line) for line in (config.output_dir / "metrics.jsonl").read_text().splitlines()]
     assert [r["split"] for r in records] == ["eval", "train", "eval"]
+    if generation == "vllm":
+        assert external_versions == [0, 0, 2]
+        assert not list(config.rollout_checkpoint_dir.glob("policy-*"))
 
 
 def test_real_two_process_dtensor_best_bridge(tmp_path):

@@ -14,7 +14,8 @@ from .engine import NvidiaFSDPEngine, LossOutput, StepResult, RolloutResult, loc
 from .state import Phase
 from .weights import WeightSink, HFCheckpointSink, export_model_only_hf
 from .best_checkpoint import DistributedBestCheckpoint
+from .generation import ExternalGeneration
 
 __all__ = ["FSDPConfig", "GenerationConfig", "NvidiaContext", "NvidiaFSDPEngine",
            "LossOutput", "StepResult", "RolloutResult", "local_hf_factory", "Phase",
-           "WeightSink", "HFCheckpointSink", "export_model_only_hf", "DistributedBestCheckpoint"]
+           "WeightSink", "HFCheckpointSink", "export_model_only_hf", "DistributedBestCheckpoint", "ExternalGeneration"]

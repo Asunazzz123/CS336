@@ -15,6 +15,10 @@ import subprocess
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+# Keep the historical import surface for small-model tooling.
+from scripts.train_grpo_base import *
 
 
 def main():
