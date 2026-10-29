@@ -1,9 +1,5 @@
 # Assignment 5: GSM8K SFT and GRPO Training Results
 
-Code is organized by responsibility: thin `scripts/` entry points, training applications,
-FSDP systems, generation services, checkpointing, profiling/diagnostics, and orchestration.
-See [module boundaries and migration](ARCHITECTURE.md); experiment profiles preview commands by default.
-
 The text backbone of **Qwen/Qwen3.5-4B-Base** was fine-tuned on GSM8K in two completed
 SFT-to-RL experiments: an initial BF16-parameter run and an FP32-parameter/BF16-autocast
 rerun. Each experiment completed **100 SFT updates and 100 RL updates** on one NVIDIA
