@@ -12,12 +12,13 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, GPT2Config, GPT2LMHeadModel
 
-from alignment.fsdp_grpo import FSDPGRPOTrainer, batch_from_rollout, policy_log_probs
+from training.backends.fsdp_grpo_update import FSDPGRPOTrainer, batch_from_rollout, policy_log_probs
 from alignment.grpo import run_compute_policy_gradient_loss
 from distributed import DistributedBestCheckpoint, RolloutResult, Phase
-from scripts.train_grpo_unified import UnifiedGRPOConfig, train
-from scripts.fsdp_grpo_runtime import validate_fsdp_config, evaluate
-from utils.best_checkpoint import validate_hf_checkpoint
+from training.configs import UnifiedGRPOConfig
+from training.trainers.grpo import train
+from training.backends.fsdp_grpo import validate_fsdp_config, evaluate
+from checkpointing.best import validate_hf_checkpoint
 from utils.device import nvidia_cuda_available
 from .test_distributed_runtime import local_engine, LocalCollectives
 
@@ -76,7 +77,7 @@ def test_fsdp_adapter_matches_unsharded_reference_across_epochs(normalization, m
 def test_on_policy_skips_old_pass_and_rejects_stale_rollouts(monkeypatch):
     engine = local_engine(tiny_model())
     trainer = FSDPGRPOTrainer(engine, gradient_accumulation_steps=2)
-    from alignment import fsdp_grpo
+    from training.backends import fsdp_grpo_update as fsdp_grpo
     real = fsdp_grpo.policy_log_probs
     calls = []
     def score(*args):
@@ -161,7 +162,7 @@ def test_fsdp_constraints_and_whole_group_partition():
 
 
 def test_evaluation_excludes_duplicate_padding_on_short_rank(monkeypatch):
-    from scripts import fsdp_grpo_runtime as runtime
+    from training.backends import fsdp_grpo as runtime
     engine = local_engine(tiny_model())
     engine.context.rank, engine.context.world_size = 1, 2
     # Rank 1 has no real examples when evaluation size is 1. Only remote totals count.
@@ -183,7 +184,7 @@ def test_unified_entry_runs_local_tiny_training_and_best_export(tmp_path, monkey
     from tokenizers.models import WordLevel
     from tokenizers.pre_tokenizers import Whitespace
     from transformers import PreTrainedTokenizerFast
-    from scripts import fsdp_grpo_runtime as runtime
+    from training.backends import fsdp_grpo as runtime
     model_path = tmp_path / "model"
     model = tiny_model()
     model.generation_config.suppress_tokens = [0, 2]

@@ -5,14 +5,16 @@ Each visible GPU (up to two) executes SFT, basic RL, and full GRPO separately.
 """
 
 import gc
+from dataclasses import replace
 
 import pytest
 import torch
 
 from alignment.sft import SFTExample, encode_sft_examples
-from scripts.train_grpo import RolloutBatch, Runtime, TrainConfig, train_on_rollouts
-from scripts.train_grpo_full import FullGRPOConfig, train_on_rollouts_full
-from scripts.train_sft import train_sft_step
+from training.types import RolloutBatch, Runtime
+from training.configs import UnifiedGRPOConfig as TrainConfig
+from training.trainers.grpo import train_rollout_batch as train_on_rollouts
+from training.trainers.sft import train_sft_step
 
 
 CUDA_DEVICES = [f"cuda:{index}" for index in range(min(torch.cuda.device_count(), 2))]
@@ -101,7 +103,7 @@ def test_qwen35_amp_checkpoint_training_and_cached_decode(cuda_runtime, stage, t
         if stage == "rl":
             loss, _ = train_on_rollouts(runtime, rollouts, base)
         else:
-            loss, _ = train_on_rollouts_full(runtime, rollouts, FullGRPOConfig(base))
+            loss, _ = train_on_rollouts(runtime, rollouts, replace(base, num_epochs_per_rollout=3))
     torch.cuda.synchronize(device)
     assert torch.isfinite(loss)
     assert runtime.optimizer.checked_gradients

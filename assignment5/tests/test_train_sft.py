@@ -12,8 +12,14 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import AutoModelForCausalLM, AutoTokenizer, GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 
 from alignment.sft import SFTExample, collate_sft_batch, encode_sft_examples
-from scripts.train_grpo import RolloutBatch, TrainConfig, build_runtime, load_questions, train_on_rollouts
-from scripts.train_sft import SFTConfig, evaluate_sft, train, train_sft_step
+from training.types import RolloutBatch
+from training.backends.single_device import build_runtime
+from training.data.gsm8k import load_questions
+from training.configs import UnifiedGRPOConfig as TrainConfig
+from training.trainers.grpo import train_on_rollouts_unified as train_on_rollouts
+from training.configs import SFTConfig
+from training.evaluation.sft import evaluate_sft
+from training.trainers.sft import train, train_sft_step
 
 
 @pytest.fixture
@@ -136,6 +142,7 @@ def test_sft_saves_a_checkpoint_that_rl_can_load(tiny_sft_config):
     rl_config = TrainConfig(
         str(checkpoint), train_path, validation_path, tiny_sft_config.prompt_path,
         tiny_sft_config.output_dir / "rl-output", reward_type="gsm8k_numeric",
+        group_size=2, gradient_accumulation_steps=2,
     )
     runtime = build_runtime(rl_config)
     original = AutoModelForCausalLM.from_pretrained(tiny_sft_config.model_id)

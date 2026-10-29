@@ -11,7 +11,7 @@ from transformers import AutoModelForCausalLM
 
 from distributed import (DistributedBestCheckpoint, FSDPConfig, GenerationConfig,
                          NvidiaContext, NvidiaFSDPEngine)
-from alignment.fsdp_grpo import FSDPGRPOTrainer, batch_from_rollout
+from training.backends.fsdp_grpo_update import FSDPGRPOTrainer, batch_from_rollout
 from .test_fsdp_grpo_integration import tiny_model, batch
 from .test_distributed_runtime import local_engine
 

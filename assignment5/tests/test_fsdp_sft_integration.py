@@ -9,8 +9,8 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from alignment.sft import collate_sft_batch
-from scripts import fsdp_sft_runtime as runtime
-from scripts.train_sft import train
+from training.backends import fsdp_sft as runtime
+from training.trainers.sft import train
 from .test_distributed_runtime import LocalCollectives, local_engine
 from .test_fsdp_grpo_integration import tiny_model
 from .test_train_sft import tiny_sft_config
@@ -85,8 +85,9 @@ def test_rank_without_validation_examples_does_not_change_metric_denominator():
 
 
 def test_no_best_grpo_hf_output_is_directly_reloadable(config, monkeypatch):
-    from scripts import fsdp_grpo_runtime
-    from scripts.train_grpo_unified import UnifiedGRPOConfig, train as train_grpo
+    from training.backends import fsdp_grpo as fsdp_grpo_runtime
+    from training.configs import UnifiedGRPOConfig
+    from training.trainers.grpo import train as train_grpo
     class Context(LocalCollectives):
         def __enter__(self):
             return self

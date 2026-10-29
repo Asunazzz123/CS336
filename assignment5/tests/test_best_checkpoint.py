@@ -6,7 +6,7 @@ import pytest
 import torch
 from safetensors.torch import save_file, load_file
 
-from utils.best_checkpoint import BestCheckpointStore, export_cached_best, validate_hf_checkpoint
+from checkpointing.best import BestCheckpointStore, export_cached_best, validate_hf_checkpoint
 
 
 def checkpoint_writer(value):
@@ -129,7 +129,7 @@ def test_export_failure_keeps_cache_and_never_replaces_existing_data(tmp_path, m
     with pytest.raises(FileExistsError):
         store.export(existing)
     assert (existing / "important").read_text() == "preserve"
-    import utils.best_checkpoint as module
+    import checkpointing.best as module
     original_copy = module.shutil.copytree
 
     def failed_copy(source, destination, **kwargs):
@@ -279,7 +279,7 @@ def test_offline_export_write_failure_leaves_cache_and_existing_destination_inta
     (existing / "user-file").write_text("preserve")
     with pytest.raises(FileExistsError):
         export_cached_best(store.root, existing)
-    import utils.best_checkpoint as module
+    import checkpointing.best as module
 
     def failed_copy(source, destination, **kwargs):
         Path(destination).mkdir()

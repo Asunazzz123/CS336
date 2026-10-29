@@ -1,63 +1,23 @@
 """torchrun runtime for train_grpo_unified --training-backend fsdp2."""
 from dataclasses import asdict
+from training.validation import validate_fsdp_config
+from distributed.context import local_call
 import json
 import logging
 import math
 import os
 
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from training.model_factory import load_tokenizer, policy_factory
 
-from alignment.fsdp_grpo import FSDPGRPOTrainer, batch_from_rollout
+from training.backends.fsdp_grpo_update import FSDPGRPOTrainer, batch_from_rollout
 from distributed import (DistributedBestCheckpoint, FSDPConfig, GenerationConfig,
                          NvidiaContext, NvidiaFSDPEngine, RolloutResult)
-from scripts.train_grpo_base import (json_value, load_questions, load_prompt_template,
-                                    log_metrics, reward_function, sample_questions,
-                                    validate_best_data, validate_best_eval_path)
-
-
-def validate_fsdp_config(config, world_size=None):
-    for name in ("num_steps", "prompts_per_batch", "group_size", "gradient_accumulation_steps",
-                 "max_new_tokens", "generation_batch_size", "eval_examples", "eval_every", "save_every",
-                 "num_epochs_per_rollout"):
-        if hasattr(config, name) and getattr(config, name) <= 0:
-            raise ValueError(f"{name} must be positive")
-    if config.group_size < 2:
-        raise ValueError("group_size must be >=2")
-    for name in ("temperature", "cliprange"):
-        if hasattr(config, name) and (not math.isfinite(getattr(config, name)) or getattr(config, name) <= 0):
-            raise ValueError(f"{name} must be finite and positive")
-    if config.generation_backend not in ("transformers", "vllm"):
-        raise ValueError("Unknown generation backend")
-    if config.generation_backend == "vllm":
-        utilization = getattr(config, "vllm_memory_utilization", 0.8)
-        if not math.isfinite(utilization) or not 0 < utilization < 1:
-            raise ValueError("vllm_memory_utilization must be between 0 and 1")
-        for name in ("vllm_startup_timeout", "vllm_max_model_len"):
-            if getattr(config, name, 1) <= 0:
-                raise ValueError(f"{name} must be positive")
-    if config.optimizer_name != "adamw" or config.optimizer_device != "model":
-        raise ValueError("fsdp2 requires GPU-sharded AdamW (--optimizer-name adamw --optimizer-device model)")
-    if config.dtype not in ("float32", "bfloat16"):
-        raise ValueError("fsdp2 supports float32/bfloat16 compute and FP32 master shards")
-    if world_size is not None:
-        if config.prompts_per_batch % world_size:
-            raise ValueError("prompts_per_batch must be divisible by world_size to keep groups intact")
-        local_size = config.prompts_per_batch // world_size * config.group_size
-        if not local_size or local_size % config.gradient_accumulation_steps:
-            raise ValueError("Per-rank rollout batch must be divisible by gradient_accumulation_steps")
-
-
-def local_call(ctx, fn):
-    """Surface tokenization/reward errors on all peers before the next forward."""
-    result, error = None, None
-    try:
-        result = fn()
-    except Exception as exc:
-        error = exc
-    if not ctx.all_true(error is None):
-        raise RuntimeError(f"Rank-local GRPO preparation failed; local error: {error}") from error
-    return result
+from utils.serialization import json_value
+from profiling.metrics import log_metrics
+from alignment.rewards.factory import reward_function
+from training.data.gsm8k import load_questions, load_prompt_template, validate_best_data, validate_best_eval_path
+from training.data.sampling import sample_questions
 
 
 def generate(engine, tokenizer, prompts, config, *, temperature):
@@ -155,25 +115,8 @@ def train_fsdp(config):
             return train_questions, validation[:config.eval_examples], template
         train_questions, validation, template = ctx.root_call(prepare)
         reward_fn = local_call(ctx, lambda: reward_function(config))
-        tokenizer = local_call(ctx, lambda: AutoTokenizer.from_pretrained(config.model_id))
-        def setup_tokenizer():
-            if tokenizer.eos_token_id is None:
-                raise ValueError("Tokenizer must define EOS")
-            if tokenizer.pad_token_id is None:
-                tokenizer.pad_token = tokenizer.eos_token
-        local_call(ctx, setup_tokenizer)
-
-        def factory():
-            hf_config = AutoConfig.from_pretrained(config.model_id)
-            # Functional attention dropout is usually copied from config at
-            # construction, so disable it before loading, including text configs.
-            for cfg in (hf_config, getattr(hf_config, "text_config", hf_config)):
-                for name in ("attention_dropout", "attention_probs_dropout_prob",
-                             "hidden_dropout_prob", "resid_pdrop", "embd_pdrop", "attn_pdrop"):
-                    if hasattr(cfg, name):
-                        setattr(cfg, name, 0.0)
-            hf_config.pad_token_id = tokenizer.pad_token_id
-            return AutoModelForCausalLM.from_pretrained(config.model_id, config=hf_config, dtype=torch.float32)
+        tokenizer = local_call(ctx, lambda: load_tokenizer(config.model_id))
+        factory = policy_factory(config.model_id, tokenizer.pad_token_id, disable_dropout=True)
 
         compute = torch.bfloat16 if config.dtype == "bfloat16" or config.autocast == "bfloat16" else torch.float32
         engine = NvidiaFSDPEngine(ctx, factory, FSDPConfig(

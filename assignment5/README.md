@@ -1,9 +1,8 @@
 # Assignment 5: GSM8K SFT and GRPO Training Results
 
-FSDP2 SFT and GRPO are available through `--training-backend fsdp2`.
-The 9B pipeline now launches two ranks and uses a separate vLLM module for generation;
-training and inference share the GPUs in separate phases. 
-Local CPU/DTensor and launcher tests pass; real two-GPU/vLLM acceptance requires NVIDIA hardware and vLLM.
+Code is organized by responsibility: thin `scripts/` entry points, training applications,
+FSDP systems, generation services, checkpointing, profiling/diagnostics, and orchestration.
+See [module boundaries and migration](ARCHITECTURE.md); experiment profiles preview commands by default.
 
 The text backbone of **Qwen/Qwen3.5-4B-Base** was fine-tuned on GSM8K in two completed
 SFT-to-RL experiments: an initial BF16-parameter run and an FP32-parameter/BF16-autocast

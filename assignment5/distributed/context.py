@@ -96,3 +96,15 @@ class NvidiaContext:
 
     def __exit__(self, *args):
         self.close()
+
+
+def local_call(ctx, fn):
+    """Surface tokenization/reward errors on all peers before the next forward."""
+    result, error = None, None
+    try:
+        result = fn()
+    except Exception as exc:
+        error = exc
+    if not ctx.all_true(error is None):
+        raise RuntimeError(f"Rank-local preparation failed; local error: {error}") from error
+    return result

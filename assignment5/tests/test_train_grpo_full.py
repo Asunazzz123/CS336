@@ -1,13 +1,16 @@
 """CPU regressions for the full runner's mixed-precision/checkpoint interface."""
 
 from copy import deepcopy
+from dataclasses import replace
 import sys
 
 import pytest
 import torch
 
-from scripts import train_grpo_full as full
-from scripts.train_grpo import RolloutBatch, Runtime, TrainConfig
+from training.trainers import grpo as full
+from training.types import RolloutBatch, Runtime
+from training.configs import UnifiedGRPOConfig as TrainConfig
+from scripts.train_grpo_unified import parse_args
 
 
 @pytest.fixture
@@ -20,26 +23,27 @@ def rollouts():
 
 
 def test_cli_preserves_full_defaults_and_forwards_runtime_options(monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["train_grpo_full.py"])
-    default = full.parse_args()
-    assert default.advantage_normalizer == default.base.advantage_normalizer == "std"
-    assert default.loss_normalization == default.base.loss_normalization == "sequence"
-    assert default.base.autocast == "none"
-    assert not default.base.gradient_checkpointing
-    assert default.base.save_optimizer_state
+    monkeypatch.setattr(sys, "argv", ["train_grpo_unified.py", "--model-id", "unused", "--num-epochs-per-rollout", "3"])
+    default = parse_args()
+    assert default.num_epochs_per_rollout == 3
+    assert default.advantage_normalizer == "std"
+    assert default.loss_normalization == "sequence"
+    assert default.autocast == "none"
+    assert not default.gradient_checkpointing
+    assert default.save_optimizer_state
 
     monkeypatch.setattr(sys, "argv", [
-        "train_grpo_full.py", "--dtype", "float32", "--autocast", "bfloat16",
+        "train_grpo_unified.py", "--model-id", "unused", "--num-epochs-per-rollout", "3", "--dtype", "float32", "--autocast", "bfloat16",
         "--gradient-checkpointing", "--no-save-optimizer-state",
         "--advantage-normalizer", "none", "--loss-normalization", "constant",
     ])
-    configured = full.parse_args()
-    assert configured.base.dtype == "float32"
-    assert configured.base.autocast == "bfloat16"
-    assert configured.base.gradient_checkpointing
-    assert not configured.base.save_optimizer_state
-    assert configured.base.advantage_normalizer == configured.advantage_normalizer == "none"
-    assert configured.base.loss_normalization == configured.loss_normalization == "constant"
+    configured = parse_args()
+    assert configured.dtype == "float32"
+    assert configured.autocast == "bfloat16"
+    assert configured.gradient_checkpointing
+    assert not configured.save_optimizer_state
+    assert configured.advantage_normalizer == "none"
+    assert configured.loss_normalization == "constant"
 
 
 def test_old_scores_are_fixed_normal_tensors_and_restore_mode(
@@ -76,7 +80,7 @@ def test_full_update_forwards_same_precision_and_activates_checkpointing(
         gradient_accumulation_steps=2, autocast="bfloat16",
         gradient_checkpointing=checkpointing,
     )
-    config = full.FullGRPOConfig(base=base)
+    config = replace(base, num_epochs_per_rollout=3)
     monkeypatch.setattr(full, "reward_function", lambda config: lambda response, truth: {
         "reward": float(response == truth), "format_reward": 0.0,
         "answer_reward": float(response == truth),
@@ -97,10 +101,12 @@ def test_full_update_forwards_same_precision_and_activates_checkpointing(
     monkeypatch.setattr(full, "run_get_response_log_probs", old_score)
     monkeypatch.setattr(full, "run_grpo_train_step", update)
     before = [parameter.detach().clone() for parameter in model.parameters()]
-    loss, metadata = full.train_on_rollouts_full(runtime, rollouts, config)
+    loss, metadata = full.train_rollout_batch(runtime, rollouts, config)
     assert observed == [
         ("old", torch.bfloat16, False),
         ("old", torch.bfloat16, False),
+        ("current", torch.bfloat16, checkpointing),
+        ("current", torch.bfloat16, checkpointing),
         ("current", torch.bfloat16, checkpointing),
     ]
     assert not model.training
@@ -153,7 +159,7 @@ def test_full_update_checks_accumulation_before_scoring(
 
     monkeypatch.setattr(full, "_compute_old_log_probs", fail_score)
     with pytest.raises(ValueError, match="divisible"):
-        full.train_on_rollouts_full(runtime, rollouts, full.FullGRPOConfig(base))
+        full.train_rollout_batch(runtime, rollouts, replace(base, num_epochs_per_rollout=3))
 
 
 def test_microbatched_old_scoring_preserves_full_update(
@@ -162,8 +168,8 @@ def test_microbatched_old_scoring_preserves_full_update(
     whole_model = deepcopy(tiny_train_model)
     micro_model = deepcopy(tiny_train_model)
     base = TrainConfig("unused", tmp_path, tmp_path, tmp_path, tmp_path,
-                       gradient_accumulation_steps=2)
-    config = full.FullGRPOConfig(base)
+                       group_size=2, gradient_accumulation_steps=2)
+    config = replace(base, num_epochs_per_rollout=3)
     monkeypatch.setattr(full, "reward_function", lambda config: lambda response, truth: {
         "reward": float(response == truth), "format_reward": 0.0,
         "answer_reward": float(response == truth),
@@ -178,9 +184,40 @@ def test_microbatched_old_scoring_preserves_full_update(
     micro_runtime = Runtime(micro_model, tokenizer, torch.optim.SGD(micro_model.parameters(), lr=0.01), None)
     with monkeypatch.context() as whole_patch:
         whole_patch.setattr(full, "_compute_old_log_probs", whole_batch_scores)
-        whole_loss, _ = full.train_on_rollouts_full(whole_runtime, rollouts, config)
-    micro_loss, _ = full.train_on_rollouts_full(micro_runtime, rollouts, config)
+        whole_loss, _ = full.train_rollout_batch(whole_runtime, rollouts, config)
+    micro_loss, _ = full.train_rollout_batch(micro_runtime, rollouts, config)
     torch.testing.assert_close(micro_loss, whole_loss, rtol=1e-5, atol=1e-6)
     for whole, micro in zip(whole_model.parameters(), micro_model.parameters()):
         torch.testing.assert_close(micro, whole, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("method", ["noclip", "grpo", "gspo"])
+def test_multi_epoch_keeps_one_fixed_old_policy(tiny_train_model, tokenizer, rollouts, tmp_path, monkeypatch, method):
+    cfg = TrainConfig("unused", tmp_path, tmp_path, tmp_path, tmp_path,
+        group_size=2, gradient_accumulation_steps=2, num_epochs_per_rollout=3,
+        importance_reweighting_method=method)
+    runtime = Runtime(tiny_train_model, tokenizer, torch.optim.SGD(tiny_train_model.parameters(), lr=0.01), None)
+    monkeypatch.setattr(full, "reward_function", lambda _: lambda response, truth: {
+        "reward": float(response == truth), "format_reward": 0., "answer_reward": float(response == truth)})
+    references = []
+    original = full.run_grpo_train_step
+    def update(**kwargs):
+        references.append(kwargs["old_log_probs"])
+        return original(**kwargs)
+    monkeypatch.setattr(full, "run_grpo_train_step", update)
+    _, metadata = full.train_rollout_batch(runtime, rollouts, cfg)
+    assert len(metadata["epoch_losses"]) == 3
+    assert len(references) == 3 and all(tensor is references[0] for tensor in references)
+    assert not references[0].requires_grad
+
+
+def test_no_reweighting_skips_old_policy_forward(tiny_train_model, tokenizer, rollouts, tmp_path, monkeypatch):
+    cfg = TrainConfig("unused", tmp_path, tmp_path, tmp_path, tmp_path,
+        group_size=2, gradient_accumulation_steps=2, num_epochs_per_rollout=3,
+        importance_reweighting_method="none")
+    runtime = Runtime(tiny_train_model, tokenizer, torch.optim.SGD(tiny_train_model.parameters(), lr=0.01), None)
+    monkeypatch.setattr(full, "_compute_old_log_probs", lambda *a, **k: pytest.fail("Unnecessary old-policy pass"))
+    monkeypatch.setattr(full, "reward_function", lambda _: lambda response, truth: {
+        "reward": float(response == truth), "format_reward": 0., "answer_reward": float(response == truth)})
+    assert len(full.train_rollout_batch(runtime, rollouts, cfg)[1]["epoch_losses"]) == 3
 

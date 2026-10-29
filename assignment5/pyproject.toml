@@ -20,7 +20,11 @@ gpu = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["alignment*", "distributed*", "utils*", "generation*"]
+include = ["alignment*", "distributed*", "utils*", "generation*", "training*", "checkpointing*", "profiling*", "diagnostics*", "orchestration*"]
+
+[tool.setuptools.package-data]
+alignment = ["prompts/*.prompt"]
+orchestration = ["*.sh"]
 
 [tool.uv]
 package = true

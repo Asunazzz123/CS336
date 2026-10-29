@@ -1,15 +1,18 @@
 """Numerical and checkpoint regressions for FP32 CPU Adam offload."""
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from scripts import train_grpo, train_grpo_full, train_sft
-from scripts.train_grpo import (
-    CPUOffloadOptimizer, RolloutBatch, Runtime, TrainConfig, optimizer_switcher,
-)
+from training.trainers import grpo as train_grpo, sft as train_sft
+from training.optim.cpu_offload import CPUOffloadOptimizer
+from training.types import RolloutBatch, Runtime
+from training.optim.factory import optimizer_switcher
+from training.configs import UnifiedGRPOConfig as TrainConfig
+from scripts import train_grpo_unified as grpo_cli, train_sft as sft_cli
 
 
 @pytest.mark.parametrize("optimizer_name", ["adam", "adamw"])
@@ -94,19 +97,19 @@ def test_optimizer_switcher_preserves_default_and_rejects_cpu_muon():
         optimizer_switcher(model, legacy)
 
 
-@pytest.mark.parametrize("module", [train_grpo, train_grpo_full, train_sft])
+@pytest.mark.parametrize("module", [grpo_cli, sft_cli])
 def test_optimizer_device_cli_default_and_forwarding(monkeypatch, module):
     monkeypatch.setattr("sys.argv", [str(module.__file__), "--model-id", "local-model"])
     parsed = module.parse_args()
-    config = parsed.base if module is train_grpo_full else parsed
+    config = parsed
     assert config.optimizer_device == "model"
     monkeypatch.setattr("sys.argv", [str(module.__file__), "--model-id", "local-model",
                                     "--optimizer-device", "cpu"])
     parsed = module.parse_args()
-    config = parsed.base if module is train_grpo_full else parsed
+    config = parsed
     assert config.optimizer_device == "cpu"
-    if module is train_sft:
-        assert module._runtime_config(config, Path("prompt.txt")).optimizer_device == "cpu"
+    if module is sft_cli:
+        assert train_sft._runtime_config(config, Path("prompt.txt")).optimizer_device == "cpu"
     monkeypatch.setattr("sys.argv", [str(module.__file__), "--model-id", "local-model",
                                     "--optimizer-device", "cpu", "--optimizer-name", "muon"])
     with pytest.raises(SystemExit):
@@ -131,7 +134,6 @@ def test_cpu_offload_integrates_with_accumulated_clipped_training(
         "answer_reward": float(response == truth),
     }
     monkeypatch.setattr(train_grpo, "reward_function", reward)
-    monkeypatch.setattr(train_grpo_full, "reward_function", reward)
     rollouts = RolloutBatch(["Hello"] * 2, ["world", "another test"], ["world"] * 2)
     losses = []
     for live, optimizer in ((model, offloaded), (reference, standard)):
@@ -145,11 +147,9 @@ def test_cpu_offload_integrates_with_accumulated_clipped_training(
         else:
             runtime = Runtime(live, tokenizer, optimizer, live)
             if stage == "rl":
-                loss, _ = train_grpo.train_on_rollouts(runtime, rollouts, base)
+                loss, _ = train_grpo.train_rollout_batch(runtime, rollouts, base)
             else:
-                loss, _ = train_grpo_full.train_on_rollouts_full(
-                    runtime, rollouts, train_grpo_full.FullGRPOConfig(base),
-                )
+                loss, _ = train_grpo.train_rollout_batch(runtime, rollouts, replace(base, num_epochs_per_rollout=3))
         losses.append(loss)
         assert all(parameter.grad is None for parameter in live.parameters())
     assert torch.equal(losses[0], losses[1])

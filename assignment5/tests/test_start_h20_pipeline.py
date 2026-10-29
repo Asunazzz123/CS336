@@ -41,7 +41,7 @@ previous=''
 for argument in "$@"; do
     case "$argument" in
         */train_sft.py) stage=sft ;;
-        */train_grpo.py|*/train_grpo_full.py|*/train_grpo_unified.py) stage=rl ;;
+        */train_grpo_unified.py) stage=rl ;;
     esac
     if [[ "$previous" == --output-dir ]]; then output="$argument"; fi
     if [[ "$previous" == --best-checkpoint-dir ]]; then best="$argument"; fi

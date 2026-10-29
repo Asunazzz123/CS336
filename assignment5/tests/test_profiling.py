@@ -6,7 +6,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from scripts import profiling, train_grpo, train_sft
+from profiling import nvtx as profiling
+from training.optim import cpu_offload as train_grpo
+from training.trainers import sft as train_sft
+from training import losses
 
 
 @pytest.mark.parametrize("enabled,device", [(None, "cuda:0"), ("0", "cuda:0"),
@@ -82,6 +85,7 @@ def test_annotations_preserve_accumulated_sft_and_split_offload_phases(monkeypat
             assert stack.pop() == name
 
     monkeypatch.setattr(train_sft, "nvtx_range", scope)
+    monkeypatch.setattr(losses, "nvtx_range", scope)
     monkeypatch.setattr(train_grpo, "nvtx_range", scope)
     loss, metadata = train_sft.train_sft_step(annotated, optimizer, records, 0, 1)
     assert not stack

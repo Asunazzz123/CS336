@@ -1,0 +1,18 @@
+{
+  "name": "4B single-GPU SFT then GRPO",
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "0",
+    "MODEL_PATH": "/dev/shm/cs336-models/Qwen3.5-4B-Base-text",
+    "TRAINING_BACKEND": "transformers",
+    "OPTIMIZER_DEVICE": "model",
+    "GENERATION_BACKEND": "transformers",
+    "NPROC_PER_NODE": "1",
+    "SFT_EPOCHS": "1",
+    "SFT_MAX_STEPS": "",
+    "RL_STEPS": "100",
+    "SFT_ACCUMULATION_STEPS": "8",
+    "RL_ACCUMULATION_STEPS": "8",
+    "EVAL_EXAMPLES": "256",
+    "SEED": "42"
+  }
+}

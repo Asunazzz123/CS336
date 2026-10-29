@@ -10,8 +10,10 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 
-from scripts.train_grpo import TrainConfig, _bf16_cpu_state_dict, save_checkpoint
-from scripts.train_sft import SFTConfig
+from training.configs import RuntimeConfig as TrainConfig
+from checkpointing.hf import bf16_cpu_state_dict as _bf16_cpu_state_dict
+from training.checkpoint_policy import save_checkpoint
+from training.configs import SFTConfig
 
 
 @pytest.fixture

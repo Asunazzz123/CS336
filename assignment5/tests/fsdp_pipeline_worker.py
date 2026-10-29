@@ -10,11 +10,11 @@ from tokenizers.models import WordLevel
 from transformers import AutoModelForCausalLM, PreTrainedTokenizerFast
 from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
 
-from alignment.fsdp_grpo import FSDPGRPOTrainer, batch_from_rollout
+from training.backends.fsdp_grpo_update import FSDPGRPOTrainer, batch_from_rollout
 from alignment.sft import collate_sft_batch
 from distributed import DistributedBestCheckpoint, ExternalGeneration, FSDPConfig, NvidiaContext, NvidiaFSDPEngine
 from generation.vllm import VLLMBackend
-from scripts.fsdp_sft_runtime import loss_output, padded_microbatches, evaluate_sft
+from training.backends.fsdp_sft import loss_output, padded_microbatches, evaluate_sft
 from .test_fsdp_grpo_integration import tiny_model
 from .test_fsdp_sft_integration import records
 

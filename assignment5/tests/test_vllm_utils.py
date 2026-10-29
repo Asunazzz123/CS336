@@ -7,7 +7,7 @@ from types import GeneratorType, ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from alignment import vllm_utils
+from generation import vllm as vllm_utils
 
 
 def install_transfer_stub(monkeypatch, send):
@@ -211,7 +211,7 @@ def test_dummy_text_wrapper_requires_successful_sync_before_generation(tmp_path,
 
 
 def test_worker_probe_reads_small_samples_without_modifying_weights():
-    from alignment.vllm_worker import WeightSyncProbe
+    from generation.worker import WeightSyncProbe
     model = torch.nn.Linear(3, 2, bias=False)
     before = model.weight.detach().clone()
     worker = WeightSyncProbe()

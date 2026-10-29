@@ -14,7 +14,7 @@ from distributed.generation import ExternalGeneration
 from distributed import Phase
 from generation import PolicySnapshot
 from generation import vllm
-from utils.best_checkpoint import validate_hf_checkpoint
+from checkpointing.best import validate_hf_checkpoint
 from .test_distributed_runtime import local_engine
 from .test_fsdp_grpo_integration import tiny_model
 from .test_vllm_utils import install_transfer_stub

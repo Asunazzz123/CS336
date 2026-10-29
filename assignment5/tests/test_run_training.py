@@ -91,7 +91,7 @@ def _wait_for_exit(env, expected):
 
 @pytest.mark.parametrize(
     ("mode", "entry"),
-    [("sft", "train_sft.py"), ("grpo", "train_grpo.py"), ("grpo-full", "train_grpo_full.py")],
+    [("sft", "train_sft.py"), ("grpo", "train_grpo_unified.py"), ("grpo-full", "train_grpo_unified.py")],
 )
 def test_run_selects_entry_and_preserves_argument_boundaries(launcher_env, tmp_path, mode, entry):
     model = "SFT checkpoint with spaces;$HOME"
@@ -108,6 +108,11 @@ def test_run_selects_entry_and_preserves_argument_boundaries(launcher_env, tmp_p
     assert args[args.index("-n") + 1] == "agent"
     assert "python" in args
     assert any(Path(arg).name == entry for arg in args)
+    if mode != "sft":
+        assert args[args.index("--num-epochs-per-rollout") + 1] == ("1" if mode == "grpo" else "3")
+        if mode == "grpo":
+            assert args[args.index("--advantage-normalizer") + 1] == "none"
+            assert args[args.index("--loss-normalization") + 1] == "constant"
     assert args[args.index("--model-id") + 1] == model
     assert args[args.index("--output-dir") + 1] == str(output_dir)
     _wait_for_exit(launcher_env, 0)
@@ -118,7 +123,7 @@ def test_default_entry_and_artifacts_are_isolated_from_control_files(launcher_en
     assert result.returncode == 0, result.stdout + result.stderr
     _wait_for_exit(launcher_env, 0)
     received = Path(launcher_env["FAKE_RECORD"]).read_text().splitlines()
-    assert any(Path(arg).name == "train_grpo_full.py" for arg in received)
+    assert any(Path(arg).name == "train_grpo_unified.py" for arg in received)
     assert Path(received[received.index("--output-dir") + 1]) == _job_dir(launcher_env) / "artifacts"
     assert "fake training finished" in (_job_dir(launcher_env) / "train.log").read_text()
 

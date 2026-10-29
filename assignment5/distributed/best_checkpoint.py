@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import torch
 
-from utils.best_checkpoint import BestCheckpointStore
+from checkpointing.best import BestCheckpointStore
 from .state import Phase
 from .weights import export_model_only_hf
 

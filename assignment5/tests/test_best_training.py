@@ -9,8 +9,10 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from scripts import train_grpo, train_grpo_full, train_sft
-from scripts.train_grpo import RolloutBatch
+from training.trainers import grpo as train_grpo, sft as train_sft
+from training.types import RolloutBatch
+from scripts.train_grpo_unified import parse_args
+from utils.paths import PROJECT_DIR
 from .test_train_grpo import config
 from .test_train_sft import tiny_sft_config
 
@@ -84,7 +86,8 @@ def test_rl_best_exports_validation_peak_instead_of_later_live_weights(config, t
     validation.write_text(json.dumps({"question": "Held out three ?", "answer": "reason #### 3"}) + "\n")
     cfg = replace(config, eval_path=validation, best_checkpoint_dir=tmp_path / "ram-cache",
                   num_steps=2, eval_every=1, save_every=1)
-    module = train_grpo_full if full else train_grpo
+    module = train_grpo
+    cfg = replace(cfg, num_epochs_per_rollout=3 if full else 1)
     original_build = module.build_runtime
     held = {}
     snapshots = []
@@ -113,8 +116,8 @@ def test_rl_best_exports_validation_peak_instead_of_later_live_weights(config, t
     monkeypatch.setattr(module, "build_runtime", build)
     monkeypatch.setattr(module, "evaluate", evaluate)
     monkeypatch.setattr(module, "generate_rollouts", lambda *args: RolloutBatch(["q"] * 4, ["r"] * 4, ["3"] * 4))
-    monkeypatch.setattr(module, "train_on_rollouts_full" if full else "train_on_rollouts", update)
-    module.train(train_grpo_full.FullGRPOConfig(cfg) if full else cfg)
+    monkeypatch.setattr(module, "train_rollout_batch", update)
+    module.train(cfg)
     assert update_count[0] == 2 and len(snapshots) == 3
     assert any(not torch.equal(snapshots[1][name], snapshots[2][name]) for name in snapshots[1])
     with torch.no_grad():
@@ -123,26 +126,29 @@ def test_rl_best_exports_validation_peak_instead_of_later_live_weights(config, t
     assert not cfg.best_checkpoint_dir.exists()
 
 
-@pytest.mark.parametrize("module", [train_grpo, train_grpo_full], ids=["basic-grpo", "full-grpo"])
-def test_best_cli_cannot_select_on_default_official_test(module, tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(sys, "argv", ["trainer", "--model-id", "unused", "--best-checkpoint-dir", str(tmp_path / "ram")])
+@pytest.mark.parametrize("epochs", [1, 3], ids=["basic-grpo", "full-grpo"])
+def test_best_cli_cannot_select_on_default_official_test(epochs, tmp_path, monkeypatch, capsys):
+    module = train_grpo
+    monkeypatch.setattr(sys, "argv", ["trainer", "--model-id", "unused", "--num-epochs-per-rollout", str(epochs), "--best-checkpoint-dir", str(tmp_path / "ram")])
     with pytest.raises(SystemExit) as error:
-        module.parse_args()
+        parse_args()
     assert error.value.code == 2
     assert "validation data" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("module", [train_grpo, train_grpo_full], ids=["basic-grpo", "full-grpo"])
-def test_programmatic_best_rejects_training_questions_in_validation(config, tmp_path, monkeypatch, module):
+@pytest.mark.parametrize("epochs", [1, 3], ids=["basic-grpo", "full-grpo"])
+def test_programmatic_best_rejects_training_questions_in_validation(config, tmp_path, monkeypatch, epochs):
+    module = train_grpo
+    config = replace(config, num_epochs_per_rollout=epochs)
     cfg = replace(config, best_checkpoint_dir=tmp_path / "ram-cache")  # Fixture uses the same train/eval file.
     monkeypatch.setattr(module, "build_runtime", lambda *args: pytest.fail("Model was loaded before validation rejection"))
     with pytest.raises(ValueError, match="disjoint"):
-        module.train(train_grpo_full.FullGRPOConfig(cfg) if module is train_grpo_full else cfg)
+        module.train(cfg)
     assert not cfg.best_checkpoint_dir.exists()
 
 
 def test_sft_best_rejects_explicit_official_test_path(tiny_sft_config, tmp_path, monkeypatch):
-    cfg = replace(tiny_sft_config, best_checkpoint_dir=tmp_path / "ram", eval_path=train_grpo.PROJECT_DIR / "data/gsm8k/test.jsonl")
+    cfg = replace(tiny_sft_config, best_checkpoint_dir=tmp_path / "ram", eval_path=PROJECT_DIR / "data/gsm8k/test.jsonl")
     monkeypatch.setattr(train_sft, "build_runtime", lambda *args: pytest.fail("Model loaded before test-path rejection"))
     with pytest.raises(ValueError, match="official test"):
         train_sft.train(cfg)

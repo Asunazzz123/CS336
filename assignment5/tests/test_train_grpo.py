@@ -7,7 +7,12 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
-from scripts.train_grpo import TrainConfig, Question, RolloutBatch, build_runtime, load_questions, sample_questions, train, train_on_rollouts
+from training.types import Question, RolloutBatch
+from training.backends.single_device import build_runtime
+from training.data.gsm8k import load_questions
+from training.data.sampling import sample_questions
+from training.configs import UnifiedGRPOConfig as TrainConfig
+from training.trainers.grpo import train, train_on_rollouts_unified as train_on_rollouts
 
 @pytest.fixture
 def config(tmp_path):
@@ -26,7 +31,7 @@ def config(tmp_path):
     data_path.write_text("\n".join(json.dumps({"question": q, "answer": "reasoning #### 2"}) for q in ["What is one plus one ?", "What is two ?"]), encoding="utf-8")
     prompt_path = tmp_path / "prompt.txt"
     prompt_path.write_text("{question}", encoding="utf-8")
-    return TrainConfig(str(model_path), data_path, data_path, prompt_path, tmp_path / "output", max_new_tokens=4, eval_examples=2, reward_type="gsm8k_numeric", learning_rate=1e-3)
+    return TrainConfig(str(model_path), data_path, data_path, prompt_path, tmp_path / "output", num_steps=2, prompts_per_batch=2, group_size=2, gradient_accumulation_steps=2, eval_every=1, save_every=1, max_new_tokens=4, eval_examples=2, reward_type="gsm8k_numeric", learning_rate=1e-3)
 
 
 def test_loading_and_epoch_sampling(config):
@@ -67,3 +72,12 @@ def test_two_step_generation_training_and_reload(config):
     assert all(len(r["examples"]) > 0 for r in records)
     with pytest.raises(ValueError, match="输出目录非空"):
         train(config)
+
+
+@pytest.mark.parametrize("changes", [{"num_steps": 0}, {"num_epochs_per_rollout": 0},
+    {"learning_rate": float("nan")}, {"cliprange": float("nan")}, {"dtype": "float16"}])
+def test_invalid_programmatic_config_fails_before_model_load(config, monkeypatch, changes):
+    from training.trainers import grpo as train_grpo_unified
+    monkeypatch.setattr(train_grpo_unified, "build_runtime", lambda *args: pytest.fail("Model loaded"))
+    with pytest.raises(ValueError):
+        train(replace(config, **changes))

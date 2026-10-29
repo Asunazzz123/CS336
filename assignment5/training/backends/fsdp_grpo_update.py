@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import torch
 
 from distributed import LossOutput, Phase
-from .grpo import run_compute_group_normalized_rewards, run_compute_policy_gradient_loss
+from alignment.grpo import run_compute_group_normalized_rewards, run_compute_policy_gradient_loss
 
 
 @dataclass
